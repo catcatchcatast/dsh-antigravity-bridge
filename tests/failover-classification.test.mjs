@@ -317,25 +317,30 @@ test('bare production error leaves the account available and provides no invente
 })
 
 const retryWarning = '⚠ API error (attempt 1): upstream HTTP 429, retry in 2s, request_id="lab429"'
-for (const [name, chunks, history] of [
+for (const [name, chunks, history, status = 429] of [
   ['whole', [retryWarning], false],
   ['split', ['⚠ API error (attempt ', '1): upstream HTTP 4', '29, retry in 2s, request_id="lab429"'], false],
   ['split reason', ['⚠ API error (attempt 1): provider rej', 'ected the request: RESOURCE_EXH', 'AUSTED, retry in 2s, request_id="lab429"'], false],
   ['split diagnostics', ['⚠ API error (attempt 1): HTTP 429', ', retry in 2s, request_id="lab429"\n'], false],
   ['history ACK', [retryWarning], true],
+  ['HTTP 401', ['⚠ API error (attempt 1): HTTP 401', ', request_id="auth-trace"\n'], false, 401],
+  ['UNAUTHENTICATED', ['⚠ API error (attempt 1): UNAUTH', 'ENTICATED trace_id="auth-trace"'], true, 401],
+  ['HTTP 403', ['⚠ API error (attempt 1): provider {"code":403} trace_id="auth-trace"'], false, 403],
+  ['PERMISSION_DENIED', ['⚠ API error (attempt 1): PERMISSION_DENIED trace_id="auth-trace"'], false, 403],
+  ['TOS_VIOLATION', ['⚠ API error (attempt 1): TOS_VIOLATION trace_id="auth-trace"'], false, 403],
 ]) {
-  test('one upstream attempt, one cancel and no account switch for 429: ' + name, async () => {
+  test('one upstream attempt, one cancel and no account switch for upstream failure: ' + name, async () => {
     const a = account('a'), b = account('b')
     const { adapter, prompts, runtime } = makeRuntime({ accounts: [a, b], ratelimitAccounts: [a], retryChunks: chunks })
     const messages = history
       ? [sys, user('u0', 'old material '.repeat(22_000)), assistant('a0', [{ type: 'text', text: 'noted' }]), user('u1', 'RATELIMIT')]
       : [sys, user('u1', 'RATELIMIT')]
     const error = await rejectionOf(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'cancel429', messages }))
-    assert.equal(error.code, 'UPSTREAM_429')
-    assert.equal(error.failure.status, 429)
-    assert.match(error.message, /request_id="lab429"/)
-    assert.equal(error.failure.requestId, 'lab429')
-    assert.equal(error.failure.providerRetryAfterMs, 2000)
+    assert.equal(error.code, status === 429 ? 'UPSTREAM_429' : 'AUTH')
+    assert.equal(error.failure.status, status)
+    assert.ok(error.message.includes(chunks.join('').trimEnd()))
+    assert.equal(error.failure.requestId, status === 429 ? 'lab429' : 'auth-trace')
+    if (status === 429) assert.equal(error.failure.providerRetryAfterMs, 2000)
     assert.equal(adapter.providerRetryPolicy('antigravity').retryableCodes.includes(error.code), false)
     const log = join(a.homeDir, 'lifecycle.jsonl')
     let events

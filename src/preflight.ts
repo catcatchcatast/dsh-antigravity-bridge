@@ -64,6 +64,11 @@ export interface PreflightResult {
   unlock: UnlockState
 }
 
+/** Clear ambient auth overrides only for the spawned process. */
+export function agyChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...base, GEMINI_API_KEY: undefined, GOOGLE_API_KEY: undefined, AGY_ADC_AUTH: undefined, DSH_AGY_LOCAL_KEY: undefined }
+}
+
 /** Platform and environment overrides for executable discovery tests. */
 export interface ResolveBinaryOptions {
   platform?: NodeJS.Platform
@@ -110,6 +115,15 @@ export function resolveAgyBinary(configured: string, options: ResolveBinaryOptio
   }
   for (const dir of splitPathDirs(env, platform)) {
     candidates.push(join(dir, exeName))
+  }
+  if (platform === 'darwin' || platform === 'linux') {
+    candidates.push(join(home, '.antigravity', 'bin', 'agy'))
+    if (platform === 'darwin') {
+      candidates.push(join(home, 'Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin', 'agy'),
+        '/Applications/Antigravity.app/Contents/Resources/app/bin/agy', '/opt/homebrew/bin/agy')
+    }
+    candidates.push('/usr/local/bin/agy')
+    if (platform === 'linux') candidates.push('/usr/bin/agy')
   }
   const found = candidates.find(candidate => existsSync(candidate))
   if (found === undefined) {

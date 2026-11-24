@@ -22,7 +22,7 @@ import { FALLBACK_MODELS } from './catalog.ts'
 import { Config, current, type AccountProfile } from './config.ts'
 import type { ImageResolver } from './history.ts'
 import { CONFIG_VERSION, migrateConfig, normalizeAccounts, storedEqual, type MigrationResult } from './migrate.ts'
-import type { CommandRunner } from './preflight.ts'
+import { agyChildEnv, type CommandRunner } from './preflight.ts'
 import { AntigravityRemote, registerRemote } from './remote.ts'
 import { AntigravityRuntime } from './runtime.ts'
 
@@ -172,7 +172,7 @@ export function apply(ctx: Context, config: Config): void {
       cwd,
       stdio: { stdin: 'pipe', stdout: 'pipe', stderr: { maxBytes: 64 * 1024 } },
       graceMs: 5_000,
-      env: env ?? systemEnv,
+      env: agyChildEnv(env ?? systemEnv),
     })
     if (handle.stdin === undefined || handle.stdout === undefined) throw new Error('antigravity-acp: ACP process has no stdio pipes')
     return {
@@ -194,7 +194,7 @@ export function apply(ctx: Context, config: Config): void {
       stdio: { stdin: 'ignore', stdout: { maxBytes: 8 * 1024 * 1024 }, stderr: { maxBytes: 256 * 1024 } },
       graceMs: 3_000,
       signal: AbortSignal.timeout(timeoutMs),
-      env: { ...(env ?? systemEnv), PYTHONUTF8: '1' },
+      env: agyChildEnv({ ...(env ?? systemEnv), PYTHONUTF8: '1' }),
     })
     const outcome = await handle.done
     return {

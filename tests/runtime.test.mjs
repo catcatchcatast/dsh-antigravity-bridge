@@ -6,7 +6,7 @@
 
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -18,7 +18,7 @@ import { AntigravityAdapter } from '../lib/adapter.js'
 import { Config } from '../lib/config.js'
 import { classifyAgentNotice, toTokenUsage } from '../lib/conversation.js'
 import { BRIDGE_TEXT_BYTES, EMPTY_INPUT_CONTINUATION } from '../lib/history.js'
-import { assertSupportedAgyVersion, checkUnlock, prepareHome, resolveAgyBinary, resolvePythonArgv } from '../lib/preflight.js'
+import { agyChildEnv, assertSupportedAgyVersion, checkUnlock, prepareHome, resolveAgyBinary, resolvePythonArgv } from '../lib/preflight.js'
 import { AntigravityRemote, INVOCATIONS } from '../lib/remote.js'
 import {
   answerPermission, isBridgeServerName, recordReportedToolCall, sanitizeMcpToolArguments,
@@ -1866,6 +1866,43 @@ test('the context window is a global default narrowed by every account that can 
   })
   assert.equal(runtime.servesModel('default', 'gpt-oss-120b-medium'), false, 'an account visibleModels list still narrows on its own')
   assert.equal(windows(), 900_000, 'an account that cannot serve the model never narrows its window')
+})
+
+test('Linux and macOS fallbacks follow configured command, existing default and PATH', () => {
+  for (const platform of ['linux', 'darwin']) {
+    const home = mkdtempSync(join(tmpdir(), 'agy-path-'))
+    const make = (...parts) => {
+      const path = join(home, ...parts, 'agy')
+      mkdirSync(dirname(path), { recursive: true })
+      writeFileSync(path, '')
+      return path
+    }
+    const fallback = platform === 'linux' ? make('.antigravity', 'bin')
+      : make('Applications', 'Antigravity.app', 'Contents', 'Resources', 'app', 'bin')
+    const options = { home, platform, env: { PATH: join(home, 'custom') } }
+    assert.equal(resolveAgyBinary('', options), fallback)
+    const viaPath = make('custom')
+    assert.equal(resolveAgyBinary('', options), viaPath)
+    const preferred = make('.local', 'bin')
+    assert.equal(resolveAgyBinary('', options), preferred)
+    assert.equal(resolveAgyBinary(viaPath, options), viaPath)
+  }
+})
+
+test('agy child excludes ambient auth overrides and keeps its selected home', () => {
+  const keys = ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'AGY_ADC_AUTH', 'DSH_AGY_LOCAL_KEY']
+  const base = { HOME: 'test-home', ...Object.fromEntries(keys.map(k => [k, 'synthetic'])) }
+  const child = spawnSync(process.execPath, ['-e', 'console.log(JSON.stringify([process.env.HOME,...process.argv.slice(1).map(k=>k in process.env)]))', ...keys],
+    { env: { ...process.env, ...agyChildEnv(base) }, encoding: 'utf8' })
+  assert.equal(child.status, 0, child.stderr)
+  assert.deepEqual(JSON.parse(child.stdout), ['test-home', false, false, false, false])
+  assert.ok(keys.every(k => base[k] === 'synthetic'))
+})
+
+test('discussion of 401, 403 and provider status names stays visible', () => {
+  for (const text of ['HTTP 403 explains the failure.', 'UNAUTHENTICATED', 'PERMISSION_DENIED or TOS_VIOLATION', 'The trace shows HTTP 401.']) {
+    assert.equal(classifyAgentNotice(text).kind, 'emit')
+  }
 })
 
 test('Windows preflight locates agy.exe in LOCALAPPDATA and PATH while skipping IDE shims and WindowsApps stubs', async () => {

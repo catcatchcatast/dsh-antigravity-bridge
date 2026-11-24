@@ -37,7 +37,7 @@ import {
 } from './accounts.ts'
 import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type AvailableModel, type CatalogModel } from './catalog.ts'
 import { asDegradeAction, asEffort, asEngineMode, current, EFFORTS, type AccountProfile, type Config, type DegradeAction, type Effort, type EngineMode } from './config.ts'
-import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, reportsUpstream429, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
+import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, reportsUpstream429, upstreamRequestId, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
 import {
   addBridgeSystemInstruction, bridgeContextBlock, promptTextBytes, BRIDGE_TEXT_BYTES, bridgeSystemIdentity, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, prepareNativeRequest, splitReplay,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
@@ -1055,6 +1055,7 @@ export class AntigravityRuntime {
               resetTimeFromError(failure), failure.message)
             throw failure
           }
+          if (failure instanceof LlmError && failure.code === 'AUTH' && (failure.failure.status === 401 || failure.failure.status === 403)) throw failure
           if (emitted || attempted.has(layout.id)) throw error
           if (isUnknownModelFailure(error)) {
             slot.disabledModels = [...new Set([...(slot.disabledModels ?? []), options.model])]
@@ -1904,8 +1905,8 @@ export class AntigravityRuntime {
       turn.clearFirstResponseTimer()
       turn.events.push({ kind: 'error', error })
     }
-    turn.cancelRateRetry = cancelOnce
-    turn.onRateRetry = message => interrupt(mapError(new Error(message)))
+    turn.cancelUpstreamRetry = cancelOnce
+    turn.onUpstreamRetry = error => interrupt(mapError(error))
     if (waitForFirstResponse) {
       turn.waitForFirstResponse(() => interrupt(turn.agentFailure ?? new LlmError(labeled('TIMEOUT', 'No first response from Antigravity within 3 minutes'), 'TIMEOUT')))
     }
@@ -1916,7 +1917,7 @@ export class AntigravityRuntime {
       (error: unknown) => {
         if (conv.turn !== turn || conv.promptGen !== generation) return
         const failure = mapError(error)
-        if (failure instanceof LlmError && failure.failure.status === 429) turn.upstreamRateLimited = true
+        if (failure instanceof LlmError && failure.failure.status === 429) turn.upstreamStopped = true
         turn.events.push({ kind: 'error', error: failure })
       },
     )
@@ -2210,7 +2211,7 @@ export class AntigravityRuntime {
     }
     if (groups.length !== turn.pendingCalls.size || groups.length === 0) return false
     turn.pendingCalls.clear()
-    if (turn.upstreamRateLimited) return true
+    if (turn.upstreamStopped) return true
 
     const toolDelta = consumeToolDelta(conv, tools)
     const ended = turn.finished || !this.isTurnLive(turn)
@@ -2858,7 +2859,7 @@ export function mapError(error: unknown): Error {
       || /"reason":"(?:RATE_LIMIT_EXCEEDED|RESOURCE_EXHAUSTED)"/i.test(message)) {
     const existing = error instanceof LlmError ? error.failure : undefined
     const providerRetryAfterMs = existing?.providerRetryAfterMs ?? retryAfterMsFromError(error)
-    const requestId = existing?.requestId ?? /\b(?:request_?id|trace_?id|x-(?:goog-)?request-id)"?\s*[:=]\s*"?([\w.:-]+)/i.exec(message)?.[1]
+    const requestId = existing?.requestId ?? upstreamRequestId(message)
     const facts = {
       code: quota ? 'QUOTA' : 'UPSTREAM_429', status: 429,
       message: labeled(quota ? 'QUOTA' : 'RATE_LIMIT', message),

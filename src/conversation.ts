@@ -12,7 +12,7 @@
  * @module dsh-llm-antigravity-acp/conversation
  */
 
-import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { LlmError, ProviderRequestId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AcpPromptResult, AcpSessionUpdate } from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
@@ -28,6 +28,10 @@ const AGENT_RETRY_NOTICE = /^\s*⚠\s*(?:Error:\s*)?API error \(attempt \d+\)/i
 // 识别上游返回的限流通知，结束当前请求。
 export function reportsUpstream429(message: string): boolean {
   return /(?:^|[\s:(])429\b|\b(?:http|status|code)[_=:]\s*429\b|\b(?:RESOURCE_EXHAUSTED|RATE_LIMIT_EXCEEDED|too many requests)\b/i.test(message)
+}
+/** Extract a provider correlation ID only from failure diagnostics. */
+export function upstreamRequestId(message: string): string | undefined {
+  return /\b(?:request_?id|trace_?id|x-(?:goog-)?request-id)"?\s*[:=]\s*"?([\w.:-]+)/i.exec(message)?.[1]
 }
 /** Prefix of `AGENT_RETRY_NOTICE` while its opening words arrive across chunks. */
 const AGENT_RETRY_PREFIX = /^\s*⚠\s*(?:e(?:r(?:r(?:o(?:r:?)?)?)?)?\s*)?(?:a(?:p(?:i(?:\s+e(?:r(?:r(?:o(?:r(?:\s*\((?:a(?:t(?:t(?:e(?:m(?:p(?:t(?:\s*\d*)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/i
@@ -50,7 +54,7 @@ export type AgentNoticeVerdict =
   | { kind: 'emit' }
   | { kind: 'hold' }
   | { kind: 'drop' }
-  | { kind: 'rate-retry'; message: string }
+  | { kind: 'upstream-retry'; message: string; status: 401 | 403 | 429 }
   | { kind: 'error'; code: 'TRANSPORT' | 'RATE_LIMIT'; message: string }
 
 /** Collapse agy's warning mark and line breaks so the notice can be recognized across chunks. */
@@ -113,7 +117,12 @@ export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerd
   if (outputLimit === 'hold') return final ? { kind: 'emit' } : { kind: 'hold' }
   if (AGENT_RETRY_NOTICE.test(raw)) {
     const notice = raw.trimStart().split(/\r?\n/, 1)[0] ?? ''
-    if (reportsUpstream429(notice.replace(AGENT_RETRY_NOTICE, ''))) return { kind: 'rate-retry', message: notice }
+    const detail = notice.replace(AGENT_RETRY_NOTICE, '')
+    // Only inspect the CLI's retry envelope. A model can discuss these same codes in regular text.
+    const code = /(?:\bHTTP(?:\/\d(?:\.\d)?)?\s+|\b(?:status(?:Code)?|code)["']?\s*[:=_ ]\s*["']?|^\s*:\s*)(401|403)\b/i.exec(detail)?.[1]
+    if (code === '401' || /\bUNAUTHENTICATED\b/.test(detail)) return { kind: 'upstream-retry', status: 401, message: notice }
+    if (code === '403' || /\b(?:PERMISSION_DENIED|TOS_VIOLATION)\b/.test(detail)) return { kind: 'upstream-retry', status: 403, message: notice }
+    if (reportsUpstream429(detail)) return { kind: 'upstream-retry', status: 429, message: notice }
     if (!final && !raw.trimStart().includes('\n') && !/\b(?:EOF|ECONNRESET|ETIMEDOUT)\b/i.test(notice)) return { kind: 'hold' }
     return { kind: 'drop' }
   }
@@ -124,7 +133,7 @@ export function classifyAgentNotice(raw: string, final = false): AgentNoticeVerd
   if (text.length === 0) return { kind: 'emit' }
   if (raw.trimStart().startsWith('\u26a0')) {
     const expected = RESOURCE_WARNING.toLowerCase()
-    if (text === expected) return { kind: 'rate-retry', message: RESOURCE_WARNING }
+    if (text === expected) return { kind: 'upstream-retry', status: 429, message: RESOURCE_WARNING }
     if (!final && expected.startsWith(text)) return { kind: 'hold' }
   }
   const network = matchTerminalNotice(raw, text, NETWORK_ISSUE_HEAD, 'TRANSPORT', NETWORK_ISSUE_MESSAGE, final)
@@ -271,10 +280,10 @@ export class AcpTurn {
   retryNotices = 0
   /** Terminal transport or overload failure reported as message text by agy. */
   agentFailure: LlmError | undefined
-  upstreamRateLimited = false
-  cancelRateRetry?: () => void
-  onRateRetry?: (message: string) => void
-  private rateFlushPending = false
+  upstreamStopped = false
+  cancelUpstreamRetry?: () => void
+  onUpstreamRetry?: (error: LlmError) => void
+  private upstreamFlushPending = false
   /** Message text that may still be the start of an agy status notice. */
   private noticeHold = ''
   /** Model calls inside this turn whose usage was already emitted per-step from SQLite. */
@@ -398,7 +407,7 @@ export class AcpTurn {
    * @param update - the agent notification.
    */
   onUpdate(update: AcpSessionUpdate): void {
-    if (this.finished && !(this.rateFlushPending && update.sessionUpdate === 'agent_message_chunk')) return
+    if (this.finished && !(this.upstreamFlushPending && update.sessionUpdate === 'agent_message_chunk')) return
     const text = update.content?.type === 'text' ? update.content.text ?? '' : ''
     if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update'
       || (update.sessionUpdate === 'plan' && Array.isArray(update.entries) && update.entries.length > 0)
@@ -456,16 +465,16 @@ export class AcpTurn {
       return
     }
     this.noticeHold = ''
-    if (verdict.kind === 'rate-retry') {
+    if (verdict.kind === 'upstream-retry') {
       this.noticeHold = combined
-      this.upstreamRateLimited = true
-      if (!this.rateFlushPending) {
-        this.rateFlushPending = true
+      this.upstreamStopped = true
+      if (!this.upstreamFlushPending) {
+        this.upstreamFlushPending = true
         this.finished = true
-        this.cancelRateRetry?.()
+        this.cancelUpstreamRetry?.()
         // 立即取消。换行或 RPC 结束就交付诊断；CLI 不回执时最多给在途错误尾部 100 ms。
         if (!body.includes('\n')) setTimeout(() => {
-          if (this.rateFlushPending) this.recoverNoticeHold()
+          if (this.upstreamFlushPending) this.recoverNoticeHold()
         }, 100).unref()
       }
       if (body.includes('\n')) this.recoverNoticeHold()
@@ -498,10 +507,14 @@ export class AcpTurn {
     const held = this.noticeHold
     this.noticeHold = ''
     const verdict = classifyAgentNotice(held, true)
-    if (verdict.kind === 'rate-retry') {
-      this.rateFlushPending = false
-      this.agentFailure = new LlmError(labeled('RATE_LIMIT', verdict.message), 'RATE_LIMIT')
-      this.onRateRetry?.(verdict.message)
+    if (verdict.kind === 'upstream-retry') {
+      this.upstreamFlushPending = false
+      const requestId = upstreamRequestId(verdict.message)
+      const facts = { status: verdict.status, ...(requestId === undefined ? {} : { requestId: ProviderRequestId(requestId) }) }
+      this.agentFailure = verdict.status === 429
+        ? new LlmError(verdict.message, 'RATE_LIMIT')
+        : new LlmError(verdict.message, 'AUTH', facts)
+      this.onUpstreamRetry?.(this.agentFailure)
       return ''
     }
     if (verdict.kind === 'drop') {

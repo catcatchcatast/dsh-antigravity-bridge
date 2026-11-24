@@ -261,12 +261,12 @@ export class AcpProcess {
     const receipt = new AcpTurn('history')
     const deadline = new AbortController()
     // 历史交接也沿同一取消路径结束。
-    let cancelledForRate = false
-    receipt.cancelRateRetry = () => {
-      cancelledForRate = true
+    let cancelledForNotice = false
+    receipt.cancelUpstreamRetry = () => {
+      cancelledForNotice = true
       this.cancel(sessionId)
     }
-    receipt.onRateRetry = message => deadline.abort(new Error(message))
+    receipt.onUpstreamRetry = error => deadline.abort(error)
     receipt.waitForFirstResponse(() => deadline.abort(receipt.agentFailure ?? new Error('No first response during history handoff')))
     const stop = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
     this.listeners.set(sessionId, {
@@ -290,8 +290,8 @@ export class AcpProcess {
         throw new LlmError(`History fragment was not acknowledged (${result.stopReason}): ${reply.trim().slice(0, 80)}`, 'TRANSPORT')
       }
     } catch (error) {
-      if (stop.aborted && !cancelledForRate) this.cancel(sessionId)
-      if (cancelledForRate) {
+      if (stop.aborted && !cancelledForNotice) this.cancel(sessionId)
+      if (cancelledForNotice) {
         receipt.recoverNoticeHold()
         throw receipt.agentFailure ?? error
       }

@@ -26,7 +26,11 @@ dsh plugin --profile PROFILE_NAME add "git+https://github.com/catcatchcatast/dsh
 - 首次安装默认使用当前操作系统账号的官方 CLI 登录状态。模型可用性和额度取决于该账号。
 - `hiddenModels` 默认为空。按需隐藏名称或模型 ID；支持通配符，新模型只要与隐藏规则不匹配便可显示。
 - 默认使用 CLI 的标准上下文配置。启动时仅在显式配置 `patchScript` 后运行可选检查，`autoPatch` 默认关闭。
+- 默认 bridge 在新建和恢复会话时省略 `systemPrompt`。agy 按专用代理的工具范围生成官方系统提示，其内容可以与默认 CLI 会话不同。DSH 的工作区规则随用户上下文传入。
+- agy 在流中报告明确的认证、权限、服务条款或 429 错误时，bridge 取消当前请求并返回上游错误。只有明确的额度耗尽才会暂停对应模型组。
 - 会话续接和长历史交接使用 DSH 提供的会话消息及已有摘要。工具权限与审批由实际使用的 DSH 会话决定。
+
+关于专用代理、长会话和错误处理的取舍，见[桥接差异与验证](docs/bridge-comparison.zh.md)。
 
 ## 开发
 
