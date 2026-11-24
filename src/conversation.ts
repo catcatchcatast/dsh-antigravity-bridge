@@ -242,6 +242,8 @@ export class AcpTurn {
 
   private onModelIdle: (() => void) | undefined
   private awaitingTools = 0
+  // 模型续接与用户的同一轮请求共享计数和已完成的调用。
+  idleRecovery = { retries: 0, beforeRetry: 0, completed: [] as Pick<ParkedCall, 'name' | 'argumentsJson'>[] }
   modelStarted = false
   modelSignal: AbortSignal | undefined
 

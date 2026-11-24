@@ -22,6 +22,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, realpathSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { LlmError, ProviderRequestId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
 import { AcpProcess, type AcpConfigOption, type AcpPermissionOutcome, type AcpPermissionRequest, type AcpPromptResult, type AcpSpawner } from './acp-process.ts'
@@ -1893,6 +1894,7 @@ export class AntigravityRuntime {
     turn.modelSignal = signal
     const sessionId = conv.sessionId as string
     let cancelled = false
+    let resumeAfterCancel = false
     const cancelOnce = () => {
       if (cancelled || conv.turn !== turn || conv.promptGen !== generation || turn.modelSignal?.aborted) return
       cancelled = true
@@ -1910,20 +1912,37 @@ export class AntigravityRuntime {
     turn.onUpstreamRetry = error => interrupt(mapError(error))
     if (waitForFirstResponse) {
       turn.watchModel(() => {
-        const message = '模型生成已中断：连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。'
-        const idle = turn.modelStarted && !turn.agentFailure
-        interrupt(turn.agentFailure ?? (idle && 'fromFailure' in LlmError && typeof LlmError.fromFailure === 'function'
-          ? LlmError.fromFailure({ code: 'MODEL_IDLE', message })
-          : idle ? new LlmError(message, 'MODEL_IDLE') : new LlmError(labeled('TIMEOUT', 'No first response from Antigravity within 3 minutes'), 'TIMEOUT')))
+        if (turn.modelSignal?.aborted || conv.turn !== turn || conv.promptGen !== generation) return
+        if (turn.agentFailure) return interrupt(turn.agentFailure)
+        if (turn.idleRecovery.retries >= 5) return interrupt(idleError('已自动续接 5 次，模型仍连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。'))
+        resumeAfterCancel = true
+        turn.finished = true
+        turn.stopWatching()
+        cancelOnce()
+        // ACP 的取消是通知；旧 prompt 明确结束后才能在同一会话发送下一条。
+        turn.waitForFirstResponse(() => interrupt(idleError('未收到上次请求的取消回执，自动续接已暂停。')))
       })
     }
     const p = proc.prompt(sessionId, blocks).then(
       (result) => {
-        if (conv.turn === turn && conv.promptGen === generation) turn.events.push({ kind: 'done', result })
+        if (conv.turn !== turn || conv.promptGen !== generation) return
+        if (resumeAfterCancel && result.stopReason === 'cancelled' && !turn.modelSignal?.aborted) {
+          turn.stopWatching()
+          turn.finished = false
+          turn.idleRecovery.retries++
+          turn.idleRecovery.beforeRetry = turn.idleRecovery.completed.length
+          const next = turn.modelStarted ? [{ type: 'text' as const, text: 'Continue from where you stopped. Keep the existing answer and completed tool results; do not repeat completed actions.' }] : blocks
+          this.startPrompt(conv, proc, next, true, turn.modelSignal)
+          return
+        }
+        turn.events.push({ kind: 'done', result })
       },
       (error: unknown) => {
         if (conv.turn !== turn || conv.promptGen !== generation) return
-        const failure = mapError(error)
+        let failure = mapError(error)
+        if (resumeAfterCancel && failure instanceof LlmError && ['TIMEOUT', 'TRANSPORT', 'SERVER'].includes(failure.code)) {
+          failure = idleError(`无法确认上次请求已取消，自动续接已暂停。${failure.message}`)
+        }
         if (failure instanceof LlmError && failure.failure.status === 429) turn.upstreamStopped = true
         turn.events.push({ kind: 'error', error: failure })
       },
@@ -2226,6 +2245,9 @@ export class AntigravityRuntime {
     if (turn.upstreamStopped) return true
 
     const toolDelta = consumeToolDelta(conv, tools)
+    if (conv.engineMode === 'bridge') {
+      for (const { call } of groups) turn.idleRecovery.completed.push({ name: call.name, argumentsJson: call.argumentsJson })
+    }
     turn.modelSignal = signal
     const ended = turn.finished || !this.isTurnLive(turn)
     const continuation: AcpPromptBlock[] = []
@@ -2249,6 +2271,7 @@ export class AntigravityRuntime {
       conv.reportedToolCalls.clear()
       conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native')
       if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
+      conv.turn.idleRecovery = turn.idleRecovery
       conv.turn.modelStarted = true
       this.startPrompt(conv, proc, blocks, conv.engineMode === 'bridge', signal)
     } else {
@@ -2523,6 +2546,13 @@ export class AntigravityRuntime {
     const schema = conv.activeToolSchemas.get(name)
     const validationError = validateRequiredToolArguments(schema, args)
     if (validationError !== undefined) return { content: [{ type: 'text', text: validationError }], isError: true }
+    const recovery = turn.idleRecovery
+    if (recovery.beforeRetry && recovery.completed.some((call, index) =>
+      index < recovery.beforeRetry && call.name === name && isDeepStrictEqual(JSON.parse(call.argumentsJson), args))) {
+      const message = `自动续接请求再次执行已完成的工具 ${name}（参数相同）。请确认是否需要再执行一次。`
+      turn.onUpstreamRetry?.(idleError(message))
+      return { content: [{ type: 'text', text: message }], isError: true }
+    }
     const gated = await this.evaluateToolGate(conv, turn, signal)
     if (gated !== undefined) return gated
     const call = turn.park(name, args)
@@ -2732,6 +2762,11 @@ function describeVerdict(verdict: DegradeFingerprintResult): string {
 
 function reanswerKey(options: GenerateOptions, system: string): string {
   return `${String((options as { purpose?: string }).purpose ?? '')}|${options.model}|${digest(system)}|${messageIds(options.messages).join(',')}`
+}
+
+function idleError(message: string): LlmError {
+  if ('fromFailure' in LlmError && typeof LlmError.fromFailure === 'function') return LlmError.fromFailure({ code: 'MODEL_IDLE', message })
+  return new LlmError(message, 'MODEL_IDLE')
 }
 
 /**

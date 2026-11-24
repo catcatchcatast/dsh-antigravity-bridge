@@ -2072,7 +2072,7 @@ test('history accepts formatted acknowledgments and keeps non-ACK prose out of r
   }
 })
 
-test('idle after delivered write result preserves one write and resumes the same session on user request', async t => {
+test('idle after delivered write result resumes automatically without a second write', async t => {
   const nativeTimeout = globalThis.setTimeout
   const realClock = process.env.AGY_TEST_REAL_IDLE === '1'
   if (!realClock) t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) =>
@@ -2094,17 +2094,11 @@ test('idle after delivered write result preserves one write and resumes the same
   const history = [...messages, assistantFrom('a1', first), tool('t1', call.id, 'wrote marker')]
   const output = []
   const started = Date.now()
-  await assert.rejects(async () => {
-    for await (const chunk of adapter.stream({ ...base, messages: history })) output.push(chunk)
-  }, error => error.code === 'MODEL_IDLE' && !adapter.providerRetryPolicy('antigravity').retryableCodes.includes(error.code))
+  for await (const chunk of adapter.stream({ ...base, messages: history })) output.push(chunk)
   const elapsed = Date.now() - started
   if (realClock) assert.ok(elapsed >= 179900 && elapsed < 190000, String(elapsed))
-  assert.equal(textOf(output), 'partial after write')
+  assert.equal(textOf(output), 'partial after writecontinued once')
   assert.equal(callsOf(output).length, 0)
-  assert.equal(prompts().length, 1)
-  const next = await collect(adapter.stream({ ...base, messages: [...history, assistantFrom('a2', output), user('u2', 'continue')] }))
-  assert.equal(textOf(next), 'continued once')
-  assert.equal(callsOf(next).length, 0)
   assert.equal(prompts().length, 2)
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
   assert.equal(lifecycle().filter(e => e.op === 'cancel').length, 1)
@@ -2133,4 +2127,43 @@ test('same ACP session can request the identical side effect again on a follow-u
   assert.notEqual(repeat.id, call.id)
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
   assert.equal(readFileSync(target, 'utf8'), '1')
+})
+
+test('the fifth idle recovery can succeed without replaying partial text', async t => {
+  const nativeTimeout = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => nativeTimeout(fn, ms === 180_000 ? 120 : ms, ...args))
+  const stages = Array.from({ length: 5 }, (_, index) => ({ chunks: [`part${index} `], waitForCancel: true }))
+  const { adapter, prompts, lifecycle } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify([...stages, { text: 'complete' }]) } })
+  const chunks = await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'five', messages: [sys, user('u1', 'finish')] }))
+  assert.equal(textOf(chunks), 'part0 part1 part2 part3 part4 complete')
+  assert.equal(prompts().length, 6)
+  assert.equal(lifecycle().filter(e => e.op === 'cancel').length, 5)
+  assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
+})
+
+test('an automatic recovery cannot repeat a completed tool, including reordered arguments', async t => {
+  const nativeTimeout = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => nativeTimeout(fn, ms === 180_000 ? 300 : ms, ...args))
+  const { adapter, home, lifecycle } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify([
+    { tool: { name: 'write', args: { a: 1, b: 2 } }, chunks: ['saved'], waitForCancel: true },
+    { tool: { name: 'write', args: { b: 2, a: 1 } } },
+    { tool: { name: 'write', args: { a: 1, b: 2 } } },
+  ]) } })
+  const base = { provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'duplicate-on-recovery',
+    tools: [{ name: 'write', description: 'Append', parameters: { type: 'object', properties: { a: { type: 'number' }, b: { type: 'number' } } } }] }
+  const messages = [sys, user('u1', 'append')]
+  const first = await collect(adapter.stream({ ...base, messages }))
+  const [call] = callsOf(first)
+  const target = join(home, 'count')
+  appendFileSync(target, '1')
+  const history = [...messages, assistantFrom('a1', first), tool('t1', call.id, 'ok')]
+  const output = []
+  await assert.rejects(async () => {
+    for await (const chunk of adapter.stream({ ...base, messages: history })) output.push(chunk)
+  }, error => error.code === 'MODEL_IDLE' && /请确认/.test(error.message))
+  assert.equal(callsOf(output).length, 0)
+  assert.equal(readFileSync(target, 'utf8'), '1')
+  const explicit = await collect(adapter.stream({ ...base, messages: [...history, assistantFrom('a2', output), user('u2', 'confirmed; repeat write')] }))
+  assert.equal(callsOf(explicit)[0].name, 'write')
+  assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
 })
