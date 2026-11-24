@@ -2167,3 +2167,39 @@ test('an automatic recovery cannot repeat a completed tool, including reordered 
   assert.equal(callsOf(explicit)[0].name, 'write')
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
 })
+
+for (const [name, args] of [
+  ['job_output', { job_id: 'job-1', wait: false }], ['job_list', {}], ['list_agents', {}],
+  ['read', { path: 'progress.txt' }], ['glob', { pattern: '*.txt' }], ['grep', { pattern: 'done' }],
+]) {
+  test('idle recovery queries fresh DSH output for ' + name, async t => {
+    const realTimeout = globalThis.setTimeout
+    t.mock.method(globalThis, 'setTimeout', (fn, ms, ...rest) => realTimeout(fn, ms === 180_000 ? 350 : ms, ...rest))
+    const query = { name, args }
+    const { adapter, lifecycle, mcpResults } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify([
+      { tool: query, chunks: ['waiting'], waitForCancel: true }, { tool: query },
+    ]) } })
+    const base = { provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'query-recovery',
+      tools: [{ name, description: 'Query', parameters: { type: 'object', properties: Object.fromEntries(
+        Object.entries(args).map(([key, value]) => [key, { type: typeof value }])) } }] }
+    const messages = [sys, user('u1', 'check progress')]
+    const first = await collect(adapter.stream({ ...base, messages }))
+    const [original] = callsOf(first)
+    assert.equal(original.name, name)
+    messages.push(assistantFrom('a1', first), tool('t1', original.id, '[status: running]'))
+    const second = await collect(adapter.stream({ ...base, messages }))
+    const [poll] = callsOf(second)
+    assert.equal(poll.name, name)
+    assert.deepEqual(JSON.parse(poll.arguments), args)
+    assert.notEqual(poll.id, original.id)
+    messages.push(assistantFrom('a2', second), tool('t2', poll.id, 'new output: completed'))
+    const done = await collect(adapter.stream({ ...base, messages }))
+    assert.equal(finishOf(done).reason.kind, 'stop')
+    assert.match(textOf(done), /new output: completed/)
+    const results = mcpResults().filter(entry => entry.name === name)
+    assert.equal(results.length, 2)
+    assert.match(results[0].text, /status: running/)
+    assert.match(results[1].text, /new output: completed/)
+    assert.equal(lifecycle().filter(event => event.op === 'new').length, 1)
+  })
+}

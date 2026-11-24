@@ -75,6 +75,9 @@ export {
   pageUtf8Text, READ_TOOL_RESULT, READ_TOOL_RESULT_NAME, resolveActiveToolSchemas,
 } from './tool-bridge.ts'
 
+// These DSH queries can return new data with identical arguments after a model stall.
+const LIVE_QUERY_TOOLS = new Set(['job_output', 'job_list', 'list_agents', 'read', 'glob', 'grep'])
+
 /** Parked calls answer with a still-running notice before Gemini cache TTL expiry and agy's 180-second MCP deadline. */
 export const DEFAULT_RELAY_AFTER_MS = 85_000
 /** Automatic re-answers granted for one identical request before a degraded answer is delivered as it is. Matches the harness request-retry budget so the plugin never gives up while DSH would still retry. */
@@ -2246,7 +2249,9 @@ export class AntigravityRuntime {
 
     const toolDelta = consumeToolDelta(conv, tools)
     if (conv.engineMode === 'bridge') {
-      for (const { call } of groups) turn.idleRecovery.completed.push({ name: call.name, argumentsJson: call.argumentsJson })
+      for (const { call } of groups) {
+        if (!LIVE_QUERY_TOOLS.has(call.name)) turn.idleRecovery.completed.push({ name: call.name, argumentsJson: call.argumentsJson })
+      }
     }
     turn.modelSignal = signal
     const ended = turn.finished || !this.isTurnLive(turn)
