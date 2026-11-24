@@ -240,12 +240,55 @@ export class AcpTurn {
   readonly events = new AsyncQueue<TurnEvent>()
   private firstResponseTimer: ReturnType<typeof setTimeout> | undefined
 
+  private onModelIdle: (() => void) | undefined
+  private awaitingTools = 0
+  modelStarted = false
+  modelSignal: AbortSignal | undefined
+
+  watchModel(onIdle: () => void): void {
+    this.onModelIdle = onIdle
+    this.resumeModel()
+  }
+
+  noteModelProgress(): void {
+    this.modelStarted = true
+    if (!this.firstResponseTimer) return
+    this.clearFirstResponseTimer()
+    if (this.onModelIdle) this.waitForFirstResponse(this.onModelIdle)
+  }
+
+  resumeModel(): void {
+    if (!this.onModelIdle || this.finished || this.awaitingTools || this.pendingCalls.size ||
+        [...this.calls.values()].some(call => !call.result.settled)) return
+    this.clearFirstResponseTimer()
+    this.waitForFirstResponse(this.onModelIdle)
+  }
+
+  async duringTool<T>(work: () => Promise<T>): Promise<T> {
+    this.modelStarted = true
+    this.awaitingTools++
+    this.clearFirstResponseTimer()
+    try { return await work() }
+    finally {
+      this.awaitingTools--
+      this.resumeModel()
+    }
+  }
+
+  stopWatching(): void {
+    this.onModelIdle = undefined
+    this.clearFirstResponseTimer()
+  }
+
   waitForFirstResponse(onTimeout: () => void): void {
     this.firstResponseTimer = setTimeout(() => {
       this.firstResponseTimer = undefined
       // An unfinished status prefix can still be real model text.
       const held = this.recoverNoticeHold()
-      if (held.trim()) this.events.push({ kind: 'text', text: held })
+      if (held.trim()) {
+        this.events.push({ kind: 'text', text: held })
+        this.resumeModel()
+      }
       else onTimeout()
     }, 180_000)
   }
@@ -413,7 +456,7 @@ export class AcpTurn {
       || (update.sessionUpdate === 'plan' && Array.isArray(update.entries) && update.entries.length > 0)
       || (update.sessionUpdate === 'agent_thought_chunk' && text.trim())
       || (update.sessionUpdate === 'agent_message_chunk' && update.content && update.content.type !== 'text')) {
-      this.clearFirstResponseTimer()
+      this.noteModelProgress()
     }
     if (update.sessionUpdate === 'agent_message_chunk' && text.length > 0) {
       this.consumeMessage(text)
@@ -490,7 +533,7 @@ export class AcpTurn {
       return
     }
     if (combined.trim().length > 0) {
-      this.clearFirstResponseTimer()
+      this.noteModelProgress()
       this.agentFailure = undefined
       this.pendingNativeDenials.length = 0
     }
@@ -530,7 +573,7 @@ export class AcpTurn {
       return ''
     }
     if (held.trim().length > 0) {
-      this.clearFirstResponseTimer()
+      this.noteModelProgress()
       this.agentFailure = undefined
       this.pendingNativeDenials.length = 0
     }
@@ -542,7 +585,7 @@ export class AcpTurn {
    * @param reason - message delivered to the agent.
    */
   abandon(reason: string): void {
-    this.clearFirstResponseTimer()
+    this.stopWatching()
     for (const call of this.calls.values()) {
       call.result.resolve({ content: [{ type: 'text', text: reason }], isError: true })
     }
@@ -589,9 +632,9 @@ export interface PumpHost {
   /** Hold `text` chunks in memory while zero `thought` chunks have arrived in the current attempt. */
   holdZeroThoughtText?: boolean
   /** Send one continuation prompt in the same session; resolves with its result. */
-  continuePrompt(): Promise<AcpPromptResult>
+  continuePrompt(): void
   /** Send one in-place sandbox-policy refusal notice in the same session when `agy` aborts a turn after denying a built-in tool. */
-  continueAfterPermissionDenial?(denials: readonly NativePermissionDenial[]): Promise<AcpPromptResult>
+  continueAfterPermissionDenial?(denials: readonly NativePermissionDenial[]): void
   /** Request cancellation of the running turn. */
   cancel(): void
   /** Observe the final usage of a prompt turn. */
@@ -759,10 +802,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
         if (stop === 'max_tokens' && turn.continuations < host.maxContinuations) {
           yield * flushHeldText()
           turn.continuations++
-          void host.continuePrompt().then(
-            result => turn.events.push({ kind: 'done', result }),
-            (error: unknown) => turn.events.push({ kind: 'error', error: error instanceof Error ? error : new Error(String(error)) }),
-          )
+          host.continuePrompt()
           break
         }
         if (stop === 'end_turn' && turn.pendingNativeDenials.length > 0) {
@@ -771,10 +811,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
           if (host.continueAfterPermissionDenial !== undefined && turn.permissionContinuations < maxPermCont) {
             yield * flushHeldText()
             turn.permissionContinuations++
-            void host.continueAfterPermissionDenial(denials).then(
-              result => turn.events.push({ kind: 'done', result }),
-              (error: unknown) => turn.events.push({ kind: 'error', error: error instanceof Error ? error : new Error(String(error)) }),
-            )
+            host.continueAfterPermissionDenial(denials)
             break
           }
         }
@@ -850,6 +887,7 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
       }
       case 'error':
         turn.finished = true
+        if (event.error instanceof LlmError && event.error.code === 'MODEL_IDLE') yield * flushHeldText()
         yield * close()
         throw turn.agentFailure ?? event.error
     }

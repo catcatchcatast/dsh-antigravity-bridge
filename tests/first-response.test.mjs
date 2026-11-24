@@ -47,12 +47,17 @@ for (const event of [
   { sessionUpdate: 'tool_call_update', toolCallId: '1', status: 'in_progress' },
   { sessionUpdate: 'plan', entries: [{ content: 'Read' }] },
 ]) {
-  test('progress at 179999 ms disarms timer: ' + (event.content?.type ?? '') + event.sessionUpdate, t => {
+  test('progress at 179999 ms restarts the idle deadline: ' + (event.content?.type ?? '') + event.sessionUpdate, t => {
     const r = setup(t)
     r.tick(179999)
     r.turn.onUpdate(event)
-    r.tick(600001)
+    r.tick(179999)
     assert.deepEqual(r.cancelled, [])
+    r.tick(1)
+    assert.deepEqual(r.cancelled, ['fixture'])
+    let last
+    for (let event; (event = r.turn.events.shift());) last = event
+    assert.equal(last.error.code, 'MODEL_IDLE')
   })
 }
 
@@ -71,13 +76,15 @@ test('DSH tool waiting for its result or approval across deadline is handed off 
   assert.equal(r.turn.calls.size, 1)
 })
 
-test('ACP permission activity without a preceding tool event also disarms timeout', t => {
+test('a synchronous ACP permission answer returns control to the model', t => {
   const r = setup(t)
   r.runtime.host = { log: { warn() {} } }
   r.tick(179999)
   r.runtime.answerPermission(r.conv, { sessionId: 'fixture', options: [] })
-  r.tick(600001)
+  r.tick(179999)
   assert.deepEqual(r.cancelled, [])
+  r.tick(1)
+  assert.deepEqual(r.cancelled, ['fixture'])
 })
 
 test('normal completion clears countdown', async t => {
@@ -118,4 +125,22 @@ test('superseded generation cannot cancel a replacement', t => {
   r.conv.promptGen++
   r.tick(180000)
   assert.deepEqual(r.cancelled, [])
+})
+
+test('parallel DSH waits stay paused until both finish despite provider activity', async t => {
+  const r = setup(t)
+  const waits = []
+  const pending = [0, 1].map(() => r.turn.duringTool(() => new Promise(resolve => waits.push(resolve))))
+  waits[0]()
+  await pending[0]
+  r.turn.onUpdate({ sessionUpdate: 'plan', entries: [{ content: 'working' }] })
+  r.tick(600000)
+  assert.deepEqual(r.cancelled, [])
+  waits[1]()
+  await pending[1]
+  r.tick(179999)
+  r.turn.onUpdate({ sessionUpdate: 'usage_update', used: 100 })
+  r.tick(1)
+  assert.deepEqual(r.cancelled, ['fixture'])
+  assert.equal(r.turn.events.shift().error.code, 'MODEL_IDLE')
 })

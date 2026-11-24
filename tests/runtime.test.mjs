@@ -7,7 +7,7 @@
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
@@ -2070,4 +2070,67 @@ test('history accepts formatted acknowledgments and keeps non-ACK prose out of r
     else await assert.rejects(collect(adapter.stream(base)),e=>e.code==='TRANSPORT' && e.message.includes(reply))
     assert.equal(prompts().length,accepted?2:1)
   }
+})
+
+test('idle after delivered write result preserves one write and resumes the same session on user request', async t => {
+  const nativeTimeout = globalThis.setTimeout
+  const realClock = process.env.AGY_TEST_REAL_IDLE === '1'
+  if (!realClock) t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) =>
+    nativeTimeout(fn, ms === 180_000 ? 350 : ms, ...args))
+  const { adapter, prompts, lifecycle, home } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify([
+    { tool: { name: 'write', args: {} }, chunks: ['partial after write'], waitForCancel: true },
+    { text: 'continued once' },
+  ]) } })
+  const target = join(home, 'writes.txt')
+  const base = { provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'idle-after-write',
+    tools: [{ name: 'write', description: 'Append once', parameters: { type: 'object', properties: {} } }] }
+  const messages = [sys, user('u1', 'append a marker')]
+  const first = await collect(adapter.stream({ ...base, messages }))
+  const [call] = callsOf(first)
+  assert.equal(call.name, 'write')
+  await new Promise(resolve => nativeTimeout(resolve, realClock ? 400 : 850))
+  assert.equal(lifecycle().filter(e => e.op === 'cancel').length, 0)
+  appendFileSync(target, 'marker\n')
+  const history = [...messages, assistantFrom('a1', first), tool('t1', call.id, 'wrote marker')]
+  const output = []
+  const started = Date.now()
+  await assert.rejects(async () => {
+    for await (const chunk of adapter.stream({ ...base, messages: history })) output.push(chunk)
+  }, error => error.code === 'MODEL_IDLE' && !adapter.providerRetryPolicy('antigravity').retryableCodes.includes(error.code))
+  const elapsed = Date.now() - started
+  if (realClock) assert.ok(elapsed >= 179900 && elapsed < 190000, String(elapsed))
+  assert.equal(textOf(output), 'partial after write')
+  assert.equal(callsOf(output).length, 0)
+  assert.equal(prompts().length, 1)
+  const next = await collect(adapter.stream({ ...base, messages: [...history, assistantFrom('a2', output), user('u2', 'continue')] }))
+  assert.equal(textOf(next), 'continued once')
+  assert.equal(callsOf(next).length, 0)
+  assert.equal(prompts().length, 2)
+  assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
+  assert.equal(lifecycle().filter(e => e.op === 'cancel').length, 1)
+  assert.equal(readFileSync(target, 'utf8'), 'marker\n')
+  t.diagnostic(JSON.stringify({ elapsed, writes: 1, cancels: 1, prompts: 2, sessions: 1, realClock }))
+})
+
+test('same ACP session can request the identical side effect again on a follow-up', async () => {
+  const operation = { name: 'write', args: {} }
+  const { adapter, lifecycle, home } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify([
+    { tool: operation, text: 'result accepted' }, { tool: operation, text: 'follow-up' },
+  ]) } })
+  const base = { provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'replay-check',
+    tools: [{ name: 'write', description: 'Append once', parameters: { type: 'object', properties: {} } }] }
+  const messages = [sys, user('u1', 'append once')]
+  const first = await collect(adapter.stream({ ...base, messages }))
+  const [call] = callsOf(first)
+  const target = join(home, 'counter')
+  appendFileSync(target, '1')
+  const history = [...messages, assistantFrom('a1', first), tool('t1', call.id, 'saved')]
+  const done = await collect(adapter.stream({ ...base, messages: history }))
+  const follow = await collect(adapter.stream({ ...base, messages: [...history, assistantFrom('a2', done), user('u2', 'continue')] }))
+  const [repeat] = callsOf(follow)
+  assert.equal(repeat.name, call.name)
+  assert.equal(repeat.arguments, call.arguments)
+  assert.notEqual(repeat.id, call.id)
+  assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
+  assert.equal(readFileSync(target, 'utf8'), '1')
 })

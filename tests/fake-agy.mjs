@@ -419,6 +419,10 @@ async function runPlanStage(s, stage) {
   if (text.length > 0) {
     update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
   }
+  if (stage.waitForCancel) {
+    while (!s.cancelled) await new Promise(resolve => setTimeout(resolve, 5))
+    return { stopReason: 'cancelled' }
+  }
   const g = stage.gen ?? {}
   return {
     stopReason: stage.stop ?? 'end_turn',
