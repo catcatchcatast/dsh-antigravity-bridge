@@ -2062,6 +2062,92 @@ test('dynamic tool accepts stringified object arguments and preserves schema val
   assert.match(textOf(invalid),/Expected a JSON object/)
 })
 
+// 历史交接重试覆盖 DSH 已保存的命令输出和 ACP 取消回执。
+test('history handoff retries only the unacknowledged fragment with the saved command result', async t => {
+  const timer = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => timer(fn, ms === 180_000 ? 220 : ms, ...args))
+  const command = { name: 'bash', args: { command: 'append marker' } }
+  const { adapter, home, prompts, lifecycle, mcpResults } = makeRuntime({ env: {
+    FAKE_AGY_HANDOFF_STAGES: JSON.stringify([{ text: 'ACK' }, { waitForCancel: true }, { tool: { ...command, noPermission: true }, text: 'ACK' }]),
+    FAKE_AGY_PLAN: JSON.stringify([{ tool: command, text: 'done' }, { text: 'continued' }]),
+  } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'saved-command', tools: [bash] }
+  const first = [sys, user('u1', 'append marker')]
+  const output = await collect(adapter.stream({ ...base, messages: first }))
+  assert.deepEqual(callsOf(output).map(call => call.name), ['bash'])
+  const target = join(home, 'executions')
+  const saved = spawnSync(process.execPath, ['-e', "require('fs').appendFileSync(process.argv[1], '1'); console.log('persisted-command-result')", target], { encoding: 'utf8' })
+  assert.equal(saved.status, 0)
+  const history = [...first, assistantFrom('a1', output), tool('t1', callsOf(output)[0].id, saved.stdout.trim())]
+  const done = await collect(adapter.stream({ ...base, messages: history }))
+  assert.deepEqual(callsOf(done), [])
+  // An edited prefix forces the same cold handoff used when rebuilding DSH history.
+  const rebuilt = [sys, user('edited', 'H'.repeat(BRIDGE_TEXT_BYTES * 2)), ...history.slice(2),
+    assistantFrom('a2', done), user('u2', 'continue')]
+  const before = prompts().length
+  const answer = await collect(adapter.stream({ ...base, messages: rebuilt }))
+  assert.deepEqual(callsOf(answer), [])
+  assert.equal(textOf(answer), 'continued')
+  const sent = prompts().slice(before)
+  assert.equal(sent.length, 4)
+  assert.equal(new Set(sent.map(p => p.session)).size, 1)
+  assert.notEqual(sent[0].text, sent[1].text)
+  assert.equal(sent[1].text, sent[2].text)
+  assert.match(sent.map(p => p.text).join(''), /persisted-command-result/)
+  assert.equal(lifecycle().filter(e => e.op === 'cancel').length, 1)
+  assert.deepEqual(mcpResults().filter(e => e.name === 'bash').map(e => e.isError), [false, true])
+  assert.equal(readFileSync(target, 'utf8'), '1')
+})
+
+test('history handoff stops after five confirmed idle retries', async t => {
+  const timer = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => timer(fn, ms === 180_000 ? 120 : ms, ...args))
+  const { adapter, prompts } = makeRuntime({ env: {
+    FAKE_AGY_HANDOFF_STAGES: JSON.stringify(Array(6).fill({ waitForCancel: true })),
+  } })
+  await assert.rejects(collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon',
+    sessionId: 'idle-limit', messages: [sys, user('u1', 'Q'.repeat(BRIDGE_TEXT_BYTES - 64))] })), { code: 'MODEL_IDLE' })
+  assert.equal(prompts().length, 6)
+  assert.equal(new Set(prompts().map(p => p.text)).size, 1)
+})
+
+test('history handoff and the live answer share the five retries', async t => {
+  const timer = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => timer(fn, ms === 180_000 ? 150 : ms, ...args))
+  const { adapter, prompts } = makeRuntime({ env: {
+    FAKE_AGY_HANDOFF_STAGES: JSON.stringify(Array(5).fill({ waitForCancel: true })),
+    FAKE_AGY_PLAN: JSON.stringify([{ waitForCancel: true }]),
+  } })
+  const question = 'Q'.repeat(BRIDGE_TEXT_BYTES - 64)
+  await assert.rejects(collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon',
+    sessionId: 'shared-limit', messages: [sys, user('u1', question)] })), { code: 'MODEL_IDLE' })
+  assert.equal(prompts().length, 7)
+  assert.equal(prompts().at(-1).text, question)
+})
+
+test('history handoff never overlaps a prompt whose cancellation was not confirmed', async t => {
+  const timer = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => timer(fn, ms === 180_000 ? 150 : ms, ...args))
+  const { adapter, prompts } = makeRuntime({ env: {
+    FAKE_AGY_HANDOFF_STAGES: JSON.stringify([{ waitForCancel: true, cancelAckDelayMs: 1000 }]),
+  } })
+  await assert.rejects(collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon',
+    sessionId: 'no-receipt', messages: [sys, user('u1', 'Q'.repeat(BRIDGE_TEXT_BYTES - 64))] })), { code: 'MODEL_IDLE' })
+  assert.equal(prompts().length, 1)
+})
+
+test('history handoff respects user cancellation', async () => {
+  const { adapter, prompts } = makeRuntime({ env: { FAKE_AGY_HANDOFF_STAGES: JSON.stringify([{ waitForCancel: true }]) } })
+  const controller = new AbortController()
+  const run = collect(adapter.stream({ provider: 'antigravity', model: 'gemini-4-argon',
+    sessionId: 'cancel-handoff', messages: [sys, user('u1', 'Q'.repeat(BRIDGE_TEXT_BYTES - 64))], signal: controller.signal }))
+  const stopped = assert.rejects(run, /user paused/)
+  for (let i = 0; !prompts().length && i < 200; i++) await new Promise(resolve => setTimeout(resolve, 10))
+  controller.abort(new Error('user paused'))
+  await stopped
+  assert.equal(prompts().length, 1)
+})
+
 test('history accepts formatted acknowledgments and keeps non-ACK prose out of rate classification', async () => {
   for(const [reply,accepted] of [[' **ack.** ',true],['quota exhausted in this context',false]]) {
     const {adapter,prompts}=makeRuntime({env:{FAKE_AGY_HANDOFF_REPLY:reply}})

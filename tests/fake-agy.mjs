@@ -85,6 +85,7 @@ let nextSession = 1
 let pendingGatedStages = []
 /** Scripted per-`session/prompt` answers; `undefined` keeps the directive modes. */
 const planEntries = readPlan()
+const handoffStages = JSON.parse(process.env.FAKE_AGY_HANDOFF_STAGES ?? '[]')
 let planCursor = 0
 let lastMcpToolResultText = ''
 function readPlan() {
@@ -401,7 +402,7 @@ async function runPlanStage(s, stage) {
       if (part.text === undefined && !Array.isArray(part.chunks)) text += `${res} `
     }
     if (part.tool !== undefined) {
-      const result = await runToolCall(s, part.tool.name, part.tool.args ?? {})
+      const result = await runToolCall(s, part.tool.name, part.tool.args ?? {}, { noPermission: part.tool.noPermission })
       if (s.cancelled) return { stopReason: 'cancelled' }
       if (part.text === undefined && !Array.isArray(part.chunks)) text += `RESULT(${part.tool.name})=${result}`
     }
@@ -421,6 +422,7 @@ async function runPlanStage(s, stage) {
   }
   if (stage.waitForCancel) {
     while (!s.cancelled) await new Promise(resolve => setTimeout(resolve, 5))
+    if (stage.cancelAckDelayMs) await new Promise(resolve => setTimeout(resolve, stage.cancelAckDelayMs))
     return { stopReason: 'cancelled' }
   }
   const g = stage.gen ?? {}
@@ -680,6 +682,10 @@ rl.on('line', async (line) => {
       const handoff = promptHandoffKind(s, params.prompt)
       const text = livePromptText(s, params.prompt, handoff)
       s.cancelled = false
+      if (handoff !== undefined && handoffStages.length) {
+        const result = await runPlanStage(s, handoffStages.shift())
+        return send({ jsonrpc: '2.0', id, result })
+      }
       if (handoff !== undefined) {
         update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: process.env.FAKE_AGY_HANDOFF_REPLY ?? 'ACK' } })
       }

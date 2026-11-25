@@ -235,6 +235,11 @@ export function isReanswerFailure(error: unknown): boolean {
   return code === 'DEGRADED_ROUTE' || code === 'DEGRADED_ROUTE_EXHAUSTED'
 }
 
+export function idleError(message: string): LlmError {
+  if ('fromFailure' in LlmError && typeof LlmError.fromFailure === 'function') return LlmError.fromFailure({ code: 'MODEL_IDLE', message })
+  return new LlmError(message, 'MODEL_IDLE')
+}
+
 /** One running ACP prompt turn. */
 export class AcpTurn {
   readonly events = new AsyncQueue<TurnEvent>()
@@ -250,6 +255,33 @@ export class AcpTurn {
   watchModel(onIdle: () => void): void {
     this.onModelIdle = onIdle
     this.resumeModel()
+  }
+
+  // 普通回答与历史分片共用空闲预算，仅在 ACP 确认取消后重发。
+  awaitingIdleCancel = false
+
+  watchIdleRecovery(isCurrent: () => boolean, cancel: () => void, interrupt: (error: Error) => void): void {
+    this.awaitingIdleCancel = false
+    this.watchModel(() => {
+      if (!isCurrent()) return
+      if (this.agentFailure) return interrupt(this.agentFailure)
+      if (this.idleRecovery.retries >= 5) return interrupt(idleError('已自动续接 5 次，模型仍连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。'))
+      this.awaitingIdleCancel = true
+      this.finished = true
+      this.stopWatching()
+      cancel()
+      this.waitForFirstResponse(() => interrupt(idleError('未收到上次请求的取消回执，自动续接已暂停。')))
+    })
+  }
+
+  resumeAfterIdleCancel(result: AcpPromptResult): boolean {
+    if (!this.awaitingIdleCancel || result.stopReason !== 'cancelled') return false
+    this.awaitingIdleCancel = false
+    this.stopWatching()
+    this.finished = false
+    this.idleRecovery.retries++
+    this.idleRecovery.beforeRetry = this.idleRecovery.completed.length
+    return true
   }
 
   noteModelProgress(): void {

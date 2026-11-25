@@ -254,20 +254,21 @@ export class AcpProcess {
   }
 
   /** Consume a historical fragment without dispatching model output or granting tools. */
-  async receiveHistory(sessionId: string, text: string, signal?: AbortSignal): Promise<void> {
+  async receiveHistory(sessionId: string, text: string, recovery: AcpTurn['idleRecovery'], signal?: AbortSignal): Promise<'ack' | 'retry'> {
     const previous = this.listeners.get(sessionId)
     if (!previous) throw new Error('History handoff has no attached session')
     signal?.throwIfAborted()
     const receipt = new AcpTurn('history')
     const deadline = new AbortController()
-    // 历史交接也沿同一取消路径结束。
-    let cancelledForNotice = false
-    receipt.cancelUpstreamRetry = () => {
-      cancelledForNotice = true
-      this.cancel(sessionId)
+    receipt.idleRecovery = recovery
+    let cancelled = false
+    const cancelOnce = () => {
+      if (!cancelled) this.cancel(sessionId)
+      cancelled = true
     }
+    receipt.cancelUpstreamRetry = cancelOnce
     receipt.onUpstreamRetry = error => deadline.abort(error)
-    receipt.waitForFirstResponse(() => deadline.abort(receipt.agentFailure ?? new Error('No first response during history handoff')))
+    receipt.watchIdleRecovery(() => !signal?.aborted, cancelOnce, error => deadline.abort(error))
     const stop = signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal
     this.listeners.set(sessionId, {
       onUpdate: update => {
@@ -286,18 +287,18 @@ export class AcpProcess {
       }
       reply += receipt.recoverNoticeHold()
       if (receipt.agentFailure) throw receipt.agentFailure
+      stop.throwIfAborted()
+      if (receipt.resumeAfterIdleCancel(result)) return 'retry'
       if (result.stopReason !== 'end_turn' || !/^[`"'*\s]*ACK[`"'*.!\s]*$/i.test(reply)) {
         throw new LlmError(`History fragment was not acknowledged (${result.stopReason}): ${reply.trim().slice(0, 80)}`, 'TRANSPORT')
       }
+      return 'ack'
     } catch (error) {
-      if (stop.aborted && !cancelledForNotice) this.cancel(sessionId)
-      if (cancelledForNotice) {
-        receipt.recoverNoticeHold()
-        throw receipt.agentFailure ?? error
-      }
-      throw error
+      if (stop.aborted) cancelOnce()
+      receipt.recoverNoticeHold()
+      throw receipt.agentFailure ?? error
     } finally {
-      receipt.clearFirstResponseTimer()
+      receipt.stopWatching()
       if (this.listeners.has(sessionId)) this.listeners.set(sessionId, previous)
     }
   }
