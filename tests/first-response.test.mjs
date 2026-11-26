@@ -1,7 +1,11 @@
 
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { AcpTurn } from '../lib/conversation.js'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import { AcpTurn, pumpStep } from '../lib/conversation.js'
 import { AntigravityRuntime } from '../lib/runtime.js'
 
 
@@ -185,4 +189,58 @@ test('an upstream 429 when cancellation is in flight retains the original error'
   assert.equal(error.code, 'UPSTREAM_429')
   assert.equal(error.failure.requestId, 'idle-rate')
   assert.equal(r.prompts.length, 1)
+})
+
+// 同会话、同轮次的超时诊断。CHG-20261126-204000-agy-idle-cause-92b178e0
+test('idle failure reports partial answer and the latest generation error in this turn only', async t => {
+  const r = setup(t)
+  const dir = mkdtempSync(join(tmpdir(), 'agy-idle-cause-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const path = join(dir, 'target.db')
+  const db = new DatabaseSync(path)
+  db.exec('CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_type, status, metadata, error_details, step_payload)')
+  const insert = db.prepare('INSERT INTO steps VALUES(?,?,?,?,?,?)')
+  const field = (n, bytes) => Buffer.from([n * 8 + 2, bytes.length, ...bytes])
+  const notice = text => Buffer.concat([Buffer.from([194, 1]), Buffer.from([text.length + 4]), field(3, field(2, Buffer.from(text)))])
+  const time = second => field(1, [8, second])
+  insert.run(1, 15, 7, time(1), field(2, Buffer.from('ETIMEDOUT')), null)
+  insert.run(2, 15, 7, time(3), field(2, Buffer.from('unexpected EOF')), null)
+  insert.run(3, 17, 3, time(4), null, notice('API error (attempt 1): request failed: Post "https://private.invalid": ECONNRESET'))
+  db.close()
+  r.turn.idleRecovery.dbPath = path
+  r.turn.idleRecovery.startedAt = 2000
+  r.turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial answer' } })
+  const stream = pumpStep(r.turn, {}, undefined)
+  while ((await stream.next()).value.type !== 'text-delta') {}
+  for (let attempt = 0; attempt <= 5; attempt++) {
+    r.tick(180000)
+    await Promise.resolve()
+  }
+  await assert.rejects(async () => { for await (const chunk of stream) {} }, error => {
+    assert.equal(error.code, 'MODEL_IDLE')
+    assert.match(error.message, /部分正文.*ECONNRESET.*5 次/)
+    assert.doesNotMatch(error.message, /private|EOF|ETIMEDOUT/)
+    return true
+  })
+  for (const [session, since] of [[path, 5000], [join(dir, 'other.db'), 2000]]) {
+    const clean = new AcpTurn('different-turn')
+    Object.assign(clean.idleRecovery, { dbPath: session, startedAt: since, retries: 5 })
+    let failure
+    clean.watchIdleRecovery(() => true, () => {}, error => { failure = error })
+    r.tick(180000)
+    assert.equal(failure.code, 'MODEL_IDLE')
+    assert.doesNotMatch(failure.message, /部分正文|错误为|记录过/)
+  }
+})
+
+test('session ACP retry notice is available without a local database', t => {
+  const r = setup(t)
+  r.turn.idleRecovery.retries = 5
+  for (const text of ['⚠ API error (attempt 1): stream reading error: ', 'unexpected EOF']) {
+    r.turn.onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+  }
+  r.tick(180000)
+  const error = r.turn.events.shift().error
+  assert.match(error.message, /unexpected EOF.*5 次/)
+  assert.doesNotMatch(error.message, /部分正文/)
 })

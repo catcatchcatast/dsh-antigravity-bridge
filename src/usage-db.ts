@@ -17,6 +17,7 @@ type DatabaseSync = new (
 ) => {
   prepare(sql: string): {
     get(...params: unknown[]): Record<string, unknown> | undefined
+    iterate(...params: unknown[]): Iterable<Record<string, unknown>>
     all(...params: unknown[]): Record<string, unknown>[]
   }
   close(): void
@@ -427,6 +428,51 @@ export function decodeGenMetadata(data: Uint8Array): Omit<DecodedGenMetadataReco
     return 'next'
   })
   return ok ? decoded : undefined
+}
+
+// 超时诊断只读当前会话的生成错误。CHG-20261126-204000-agy-idle-cause-92b178e0
+function bytesField(buf: unknown, field: number): Uint8Array | undefined {
+  if (!(buf instanceof Uint8Array)) return undefined
+  let found: Uint8Array | undefined
+  walkProtoFields(buf, entry => {
+    if (entry.field !== field || entry.wire !== 2) return 'next'
+    found = entry.bytes
+    return 'stop'
+  })
+  return found
+}
+
+export function lastGenerationError(dbPath: string, sinceMs: number): string | undefined {
+  const Database = loadDatabaseSync()
+  if (!Database || !existsSync(dbPath)) return undefined
+  try {
+    const db = new Database(dbPath, { readOnly: true, timeout: 100 })
+    try {
+      const sql = [
+        'SELECT step_type, metadata, error_details, CASE WHEN step_type = 17 THEN step_payload END AS notice',
+        'FROM steps WHERE step_type = 17 OR (step_type = 15 AND status = 7) ORDER BY idx DESC',
+      ].join(' ')
+      const rows = db.prepare(sql).iterate()
+      for (const row of rows) {
+        const timestamp = bytesField(row.metadata, 1)
+        const seconds = timestamp && parseSecondsAndNanos(timestamp, true)
+        if (seconds === undefined) continue
+        if (seconds * 1000 < sinceMs) break
+        // agy 的 API 通知正文在 24.3.2，失败的模型步骤详情在 error_details.2。
+        const isNotice = row.step_type === 17
+        const detail = isNotice
+          ? bytesField(bytesField(bytesField(row.notice, 24), 3), 2)
+          : bytesField(row.error_details, 2)
+        if (!detail) continue
+        const message = Buffer.from(detail).toString('utf8')
+        if (isNotice && !/^API error \(attempt \d+\):/i.test(message)) continue
+        return message
+      }
+    } finally {
+      db.close()
+    }
+  } catch { /* Older agy versions may lack these diagnostic fields. */ }
+  return undefined
 }
 
 /**

@@ -1306,6 +1306,8 @@ export class AntigravityRuntime {
     }
     const nextKnownIds = messageIds(preparedMessages)
     const nextTurn = new AcpTurn(this.nextTurnTag(preparedMessages), engineMode === 'native')
+    // 绑定本次会话供超时诊断使用。CHG-20261126-204000-agy-idle-cause-92b178e0
+    if (conv.sessionId) nextTurn.idleRecovery.dbPath = sessionDbPath(slot.layout.geminiDir, conv.sessionId)
     const finalBlocks = await this.handoff(conv, proc, blocks, plan.rebuild && plan.history.length > 0, nextTurn.idleRecovery, options.signal)
     conv.reportedToolCalls.clear()
     conv.turn = nextTurn
@@ -1412,6 +1414,8 @@ export class AntigravityRuntime {
     conv.writableRoots = writableRoots
     const hasHistory = fresh && planPrompt(conv, systemIdentity, messages, this.host.config.provider).history.length > 0
     const nextTurn = new AcpTurn(this.nextTurnTag(messages), engineMode === 'native')
+    // 绑定本次会话供超时诊断使用。CHG-20261126-204000-agy-idle-cause-92b178e0
+    if (conv.sessionId) nextTurn.idleRecovery.dbPath = sessionDbPath(slot.layout.geminiDir, conv.sessionId)
     const finalBlocks = await this.handoff(conv, proc, blocks, hasHistory, nextTurn.idleRecovery, options.signal)
     if (fresh && conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
     conv.turn = nextTurn
