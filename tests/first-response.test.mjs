@@ -21,7 +21,7 @@ function setup(t, watched = true, acknowledge = true) {
     cancel: id => { cancelled.push(id); if (acknowledge) finish({ stopReason: 'cancelled' }) },
   }
   const runtime = Object.create(AntigravityRuntime.prototype)
-  runtime.startPrompt(conv, proc, [], watched, abort.signal)
+  runtime.startPrompt(conv, proc, [{ type: 'text', text: 'original DSH input' }], watched, abort.signal)
   return { turn, conv, abort, cancelled, runtime, prompts, finish: result => finish(result), reject: error => rejectPrompt(error), tick: ms => t.mock.timers.tick(ms) }
 }
 
@@ -77,7 +77,7 @@ for (const event of [
     assert.deepEqual(r.cancelled, ['fixture'])
     await Promise.resolve()
     assert.equal(r.prompts.length, 2)
-    assert.match(r.prompts[1].blocks[0].text, /Continue/)
+    assert.deepEqual(r.prompts[1].blocks, r.prompts[0].blocks)
   })
 }
 

@@ -1889,7 +1889,7 @@ export class AntigravityRuntime {
     return final
   }
 
-  private startPrompt(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], waitForFirstResponse = false, signal?: AbortSignal): void {
+  private startPrompt(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], waitForFirstResponse = false, signal?: AbortSignal, retryInput = blocks): void {
     const turn = conv.turn as AcpTurn
     if (conv.engineMode === 'bridge') {
       const bytes = blocks.reduce((sum, b) => sum + (b.type === 'text' ? Buffer.byteLength(b.text) : 0), 0)
@@ -1902,6 +1902,7 @@ export class AntigravityRuntime {
       }
     }
     const generation = ++conv.promptGen
+    turn.retryInput = retryInput
     turn.modelSignal = signal
     const sessionId = conv.sessionId as string
     let cancelled = false
@@ -1924,11 +1925,22 @@ export class AntigravityRuntime {
       turn.watchIdleRecovery(() => !turn.modelSignal?.aborted && conv.turn === turn && conv.promptGen === generation, cancelOnce, interrupt)
     }
     const p = proc.prompt(sessionId, blocks).then(
-      (result) => {
+      async (result) => {
         if (conv.turn !== turn || conv.promptGen !== generation) return
         if (!turn.modelSignal?.aborted && turn.resumeAfterIdleCancel(result)) {
-          const next = turn.modelStarted ? [{ type: 'text' as const, text: 'Continue from where you stopped. Keep the existing answer and completed tool results; do not repeat completed actions.' }] : blocks
-          this.startPrompt(conv, proc, next, true, turn.modelSignal)
+          let input = blocks
+          if (turn.retryInput !== blocks) {
+            // 重试已执行工具之后的模型步骤，仅传回这一批工具结果与随附消息。
+            try {
+              input = await this.handoff(conv, proc, turn.retryInput, false, turn.idleRecovery, turn.modelSignal)
+            } catch (error) {
+              turn.events.push({ kind: 'error', error: mapError(error) })
+              return
+            }
+            if (turn.modelSignal?.aborted || conv.promptGen !== generation || conv.sessionId !== sessionId) return
+            conv.turn = turn
+          }
+          this.startPrompt(conv, proc, input, true, turn.modelSignal)
           return
         }
         turn.events.push({ kind: 'done', result })
@@ -2064,7 +2076,7 @@ export class AntigravityRuntime {
         parkSettleMs: this.host.config.parkSettleMs,
         maxContinuations: this.longDecodeContinuations(),
         holdZeroThoughtText,
-        continuePrompt: () => this.startPrompt(conv, proc, [{ type: 'text', text: CONTINUE_PROMPT }], conv.engineMode === 'bridge', options.signal),
+        continuePrompt: () => this.startPrompt(conv, proc, [{ type: 'text', text: CONTINUE_PROMPT }], conv.engineMode === 'bridge', options.signal, turn.retryInput),
         continueAfterPermissionDenial: denials => this.startPrompt(conv, proc,
           [{ type: 'text', text: formatPermissionDenialContinuation(denials, conv.sessionCwd) }], conv.engineMode === 'bridge', options.signal),
         cancel: () => {
@@ -2258,21 +2270,28 @@ export class AntigravityRuntime {
         continuation.push(...await inputPrompt([message], this.host.readImage), ...tail)
       } else {
         const result = await this.toBridgeResult(conv, call.id, call.name, message.content, message.isError === true, promptTextBytes(tail))
+        if (conv.engineMode === 'bridge') {
+          if (continuation.length) continuation.push({ type: 'text', text: '\n\n' })
+          continuation.push(bridgeContextBlock(`<tool_result id="${call.id}"${result.isError ? ' error="true"' : ''}>\n`))
+          for (const block of result.content) {
+            continuation.push(block.type === 'text' ? bridgeContextBlock(block.text) : block)
+          }
+          continuation.push({ type: 'text', text: '\n</tool_result>' }, ...tail)
+        }
         result.content.push(...tail)
         call.result.resolve(result)
       }
     }
     if (ended) {
-      continuation.push({ type: 'text', text: '\n\nContinue the task with these tool results.' })
       const blocks = await this.handoff(conv, proc, continuation, false, turn.idleRecovery, signal)
       signal?.throwIfAborted()
       conv.reportedToolCalls.clear()
       conv.turn = new AcpTurn(this.nextTurnTag(messages), conv.engineMode === 'native')
       if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
       conv.turn.idleRecovery = turn.idleRecovery
-      conv.turn.modelStarted = true
       this.startPrompt(conv, proc, blocks, conv.engineMode === 'bridge', signal)
     } else {
+      if (continuation.length) turn.retryInput = continuation
       turn.resumeModel()
     }
     return true

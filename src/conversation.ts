@@ -16,7 +16,7 @@ import { LlmError, ProviderRequestId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AcpPromptResult, AcpSessionUpdate } from './acp-process.ts'
 import type { BridgeTool, BridgeToolResult } from './mcp-bridge.ts'
-import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME, type NativeSandboxMode } from './history.ts'
+import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME, type AcpPromptBlock, type NativeSandboxMode } from './history.ts'
 import { labeled } from './labels.ts'
 import type { StepUsageBatch, StepUsageSample } from './usage-db.ts'
 import { AsyncQueue, deferred, type Deferred } from './util.ts'
@@ -249,7 +249,7 @@ export class AcpTurn {
   private awaitingTools = 0
   // 模型续接与用户的同一轮请求共享计数和已完成的调用。
   idleRecovery = { retries: 0, beforeRetry: 0, completed: [] as Pick<ParkedCall, 'name' | 'argumentsJson'>[] }
-  modelStarted = false
+  retryInput: AcpPromptBlock[] = []
   modelSignal: AbortSignal | undefined
 
   watchModel(onIdle: () => void): void {
@@ -285,7 +285,6 @@ export class AcpTurn {
   }
 
   noteModelProgress(): void {
-    this.modelStarted = true
     if (!this.firstResponseTimer) return
     this.clearFirstResponseTimer()
     if (this.onModelIdle) this.waitForFirstResponse(this.onModelIdle)
@@ -299,7 +298,6 @@ export class AcpTurn {
   }
 
   async duringTool<T>(work: () => Promise<T>): Promise<T> {
-    this.modelStarted = true
     this.awaitingTools++
     this.clearFirstResponseTimer()
     try { return await work() }

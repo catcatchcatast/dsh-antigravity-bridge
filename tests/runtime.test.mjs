@@ -2186,6 +2186,7 @@ test('idle after delivered write result resumes automatically without a second w
   assert.equal(textOf(output), 'partial after writecontinued once')
   assert.equal(callsOf(output).length, 0)
   assert.equal(prompts().length, 2)
+  assert.equal(prompts()[1].text, `<tool_result id="${call.id}">\nwrote marker\n</tool_result>`)
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
   assert.equal(lifecycle().filter(e => e.op === 'cancel').length, 1)
   assert.equal(readFileSync(target, 'utf8'), 'marker\n')
@@ -2223,8 +2224,23 @@ test('the fifth idle recovery can succeed without replaying partial text', async
   const chunks = await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'five', messages: [sys, user('u1', 'finish')] }))
   assert.equal(textOf(chunks), 'part0 part1 part2 part3 part4 complete')
   assert.equal(prompts().length, 6)
+  assert.ok(prompts().every(p => p.text === prompts()[0].text))
   assert.equal(lifecycle().filter(e => e.op === 'cancel').length, 5)
   assert.equal(lifecycle().filter(e => e.op === 'new').length, 1)
+})
+
+test('idle during a max-token continuation retries the DSH step input', async t => {
+  const timer = globalThis.setTimeout
+  t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => timer(fn, ms === 180_000 ? 250 : ms, ...args))
+  const { adapter, prompts } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify([
+    { text: 'partial', stop: 'max_tokens' }, { waitForCancel: true }, { text: 'done' },
+  ]) } })
+  await collect(adapter.stream({ provider: 'antigravity', model: 'gemini-3.8-flash',
+    sessionId: 'max-tokens-idle', messages: [sys, user('u1', 'original request')] }))
+  const sent = prompts().map(p => p.text)
+  assert.equal(sent.length, 3)
+  assert.notEqual(sent[1], sent[0])
+  assert.equal(sent[2], sent[0])
 })
 
 test('an automatic recovery cannot repeat a completed tool, including reordered arguments', async t => {

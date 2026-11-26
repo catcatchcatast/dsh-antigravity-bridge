@@ -115,6 +115,10 @@ test('live tool-result MCP continuation preserves two follow-up images and keeps
     { type: 'image', data: IMAGE_A, mimeType: 'image/png' },
     { type: 'image', data: IMAGE_B, mimeType: 'image/png' },
   ])
+  const retry = messageText(turn.retryInput)
+  assert.match(retry, /^<tool_result id="call-image">/)
+  assert.ok(retry.includes('tool_result_page:'))
+  assert.equal(retry.replace('<tool_result id="call-image">\n', '').replace('\n</tool_result>', ''), messageText(delivered.content))
   const wire = messageText(delivered.content)
   assert.ok(wire.indexOf('developer before image A') < wire.indexOf(`[image:${IMAGE_A}]`))
   assert.ok(wire.indexOf(`[image:${IMAGE_A}]`) < wire.indexOf('developer after image A'))
@@ -149,7 +153,6 @@ test('a finished tool turn recovers ordered tool/developer images in the next AC
     '<harness_notice>\ndeveloper before image B\n',
     `IMAGE:${IMAGE_B}`,
     '\ndeveloper after image B\n</harness_notice>',
-    '\n\nContinue the task with these tool results.',
   ])
 })
 
