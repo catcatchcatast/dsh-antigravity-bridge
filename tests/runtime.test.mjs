@@ -2305,3 +2305,41 @@ for (const [name, args] of [
     assert.equal(lifecycle().filter(event => event.op === 'new').length, 1)
   })
 }
+
+/* CHG-20261127-132000-agy-idle-progress-340ca1ec：按已确认的 DSH 工具结果验收连续空闲次数。 */
+for (const scenario of ['six edits', 'failed edit', 'unchanged query']) {
+  test('consecutive idle recoveries after ' + scenario, async t => {
+    const timer = globalThis.setTimeout
+    t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => timer(fn, ms === 180_000 ? 250 : ms, ...args))
+    const idle = { chunks: ['working '], waitForCancel: true }
+    const name = scenario === 'unchanged query' ? 'read' : 'edit'
+    const op = index => ({ tool: { name, args: { index } } })
+    const work = { ...op(0), waitForCancel: true }
+    if (scenario === 'six edits') {
+      let tail = work
+      for (let i = 1; i < 6; i++) tail = tail.afterTool = op(i)
+    }
+    const repeated = scenario === 'unchanged query' ? { ...op(0), waitForCancel: true } : idle
+    const plan = [idle, idle, idle, work, ...Array(7).fill(repeated), { text: 'unexpected completion' }]
+    const { adapter, home, prompts } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+    const options = { provider: 'antigravity', model: 'gemini-3.8-flash', sessionId: 'idle-progress',
+      tools: [{ name, description: 'Fixture operation', parameters: { type: 'object', properties: { index: { type: 'integer' } } } }] }
+    const messages = [sys, user('u1', 'Process the fixture')]
+    const target = join(home, 'changes.txt')
+    let received = 0
+    async function run() {
+      while (true) {
+        const chunks = await collect(adapter.stream({ ...options, messages: [...messages] }))
+        const [call] = callsOf(chunks)
+        assert.ok(call, 'expected a tool call or the idle failure')
+        received++
+        if (scenario === 'six edits') appendFileSync(target, JSON.parse(call.arguments).index + '\n')
+        messages.push(assistantFrom('a' + received, chunks), tool('t' + received, call.id,
+          scenario === 'failed edit' ? 'edit failed' : 'same result', scenario === 'failed edit'))
+      }
+    }
+    await assert.rejects(run(), { code: 'MODEL_IDLE' })
+    assert.equal(prompts().length, scenario === 'failed edit' ? 6 : 9)
+    if (scenario === 'six edits') assert.equal(readFileSync(target, 'utf8'), '0\n1\n2\n3\n4\n5\n')
+  })
+}

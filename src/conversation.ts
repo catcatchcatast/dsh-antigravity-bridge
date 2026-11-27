@@ -254,6 +254,8 @@ export class AcpTurn {
     dbPath: undefined as string | undefined,
     notice: undefined as { time: number; message: string } | undefined,
     partialText: false,
+    // CHG-20261127-132000-agy-idle-progress-340ca1ec：记录连续空转，重复查询结果不计进展。
+    queryResults: new Set<string>(),
     retries: 0,
     beforeRetry: 0,
     completed: [] as Pick<ParkedCall, 'name' | 'argumentsJson'>[],
@@ -289,7 +291,7 @@ export class AcpTurn {
     // 只显示诊断类别，避免把请求地址与响应体带入会话。
     const reason = message?.match(/\b(?:unexpected EOF|EOF|ECONNRESET|ETIMEDOUT|ENOTFOUND|EPIPE|TLS handshake timeout|context deadline exceeded|connection reset by peer|connection refused|HTTP(?:\/[\d.]+)? [45]\d\d)\b/i)?.[0]
     const diagnostic = reason ? 'agy 最近一次生成请求错误为 ' + reason + '。' : message ? 'agy 记录过生成请求错误。' : ''
-    return idleError((partialText ? '模型已返回部分正文。' : '') + diagnostic + '已自动续接 ' + retries + ' 次，模型最后连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。')
+    return idleError((partialText ? '模型已返回部分正文。' : '') + diagnostic + '已连续自动续接 ' + retries + ' 次仍无新的工具成果，模型最后连续 3 分钟没有进展。已保留本轮进度，可发送“继续”。')
   }
 
   resumeAfterIdleCancel(result: AcpPromptResult): boolean {
