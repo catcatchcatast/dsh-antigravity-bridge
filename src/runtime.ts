@@ -38,7 +38,7 @@ import {
 } from './accounts.ts'
 import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type AvailableModel, type CatalogModel } from './catalog.ts'
 import { asDegradeAction, asEffort, asEngineMode, current, EFFORTS, type AccountProfile, type Config, type DegradeAction, type Effort, type EngineMode } from './config.ts'
-import { AcpTurn, idleError, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, reportsUpstream429, upstreamRequestId, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
+import { AcpTurn, idleError, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedRouteError, isBridgeToolsMissingFailure, isReanswerFailure, pumpStep, relayNotice, reportsUpstream429, upstreamRequestId, type NativePermissionDenial, type ParkedCall } from './conversation.ts'
 import {
   addBridgeSystemInstruction, bridgeContextBlock, promptTextBytes, BRIDGE_TEXT_BYTES, bridgeSystemIdentity, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, prepareNativeRequest, splitReplay,
   renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
@@ -62,8 +62,9 @@ import {
   resolveActiveToolSchemas, sanitizeMcpToolArguments, stripAgentToolPrefix, toBridgeTools, validateRequiredToolArguments, type Utf8TextPage,
 } from './tool-bridge.ts'
 import {
-  hasGenMetadata, isGemini4Flagship, peekMaxGenMetadataIdx, peekMaxModelStepIdx,
-  readGenUsageAfter, readModelStepTail, readModelStepsAfter, sessionDbPath,
+  hasGenMetadata, hasMissingBridgeToolDeclaration, hasUnknownBridgeToolStep, isGemini4Flagship,
+  peekMaxGenMetadataIdx, peekMaxModelStepIdx, peekMaxStepIdx,
+  readGenUsageAfter, readModelStepTail, readModelStepsAfter, sessionDbPath, workerMissedExperiments,
   type DegradeFingerprintResult,
 } from './usage-db.ts'
 import { delay, digest, KeyedMutex } from './util.ts'
@@ -189,6 +190,7 @@ export interface RuntimeStatus {
 /** One ACP turn's write-back context. */
 interface PumpContext {
   nextKnownIds: string[]
+  requestKey: string
 }
 
 interface CurrentToolResult {
@@ -221,6 +223,8 @@ export class AntigravityRuntime {
   private readonly gateMutex = new KeyedMutex()
   /** Re-answer budget of each conversation's current user turn; survives ACP session replacement. */
   private readonly turnBudgets = new WeakMap<Conversation, { turnKey: string; granted: number }>()
+  /** Bounded per-request recovery counter when a worker fails to mount DSH MCP tools; survives conversation eviction. */
+  private readonly mcpRecoveries = new Map<string, { key: string; retries: number }>()
   private sweeper: ReturnType<typeof setInterval> | undefined
   private lastTurn: RuntimeStatus['lastTurn']
   private overrides: LiveOverrides = {}
@@ -1263,7 +1267,7 @@ export class AntigravityRuntime {
       } else {
         const resumed = await this.deliverResults(conv, slot, preparedMessages, proc, tools, options.signal)
         if (resumed) {
-          yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(preparedMessages) })
+          yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(preparedMessages), requestKey: key })
           return
         }
         this.dropTurn(conv, 'The conversation history changed; the harness restarted this turn.')
@@ -1324,7 +1328,7 @@ export class AntigravityRuntime {
     this.pool.touch(slot.layout.id)
     const waitForFirstResponse = engineMode === 'bridge' && plan.input.some(message => message.role === 'user')
     this.startPrompt(conv, proc, finalBlocks, waitForFirstResponse, options.signal)
-    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds })
+    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds, requestKey: key })
   }
 
   /**
@@ -1422,7 +1426,7 @@ export class AntigravityRuntime {
     this.lastAccount = slot.layout.id
     this.pool.touch(slot.layout.id)
     this.startPrompt(conv, proc, finalBlocks, engineMode === 'bridge', options.signal)
-    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(messages) })
+    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(messages), requestKey: state.key ?? '' })
   }
 
   private async tryResumePersistedSession(
@@ -1480,35 +1484,57 @@ export class AntigravityRuntime {
     conv.knownTools = new Map(persisted.knownTools)
     conv.engineMode = engineMode
     conv.sessionCwd = effectiveCwd
-    const mount = mountBridge(conv, {
+    const mountPort = {
       bridgeUrl: this.bridge.url,
       engineMode,
       system,
       ...(engineMode === 'native' ? { toolContracts: renderFullToolContracts(activeSchemas, MAX_EAGER_BRIDGE_TOOL_BYTES) } : {}),
-      registerTenant: (tenantKey, tenant) => this.tenants.set(tenantKey, tenant),
-      observeConfigOptions: options => this.observeSlotCatalog(slot, options, undefined),
-      permission: request => this.answerPermission(conv, request),
-      warn: message => this.host.log.warn(message),
-    })
+      registerTenant: (tenantKey: string, tenant: Conversation) => this.tenants.set(tenantKey, tenant),
+      observeConfigOptions: (options: AcpConfigOption[]) => this.observeSlotCatalog(slot, options, undefined),
+      permission: (request: AcpPermissionRequest) => this.answerPermission(conv, request),
+      warn: (message: string) => this.host.log.warn(message),
+    }
     try {
-      const result = await proc.loadSession({
-        sessionId: persisted.acpSessionId,
-        cwd: effectiveCwd,
-        mcpServers: mount.mcpServers,
-        _meta: mount.sessionMeta,
-      }, mount.listener, 60_000)
-      conv.sessionId = result.sessionId || persisted.acpSessionId
+      let result: Awaited<ReturnType<AcpProcess['loadSession']>> | undefined
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const mount = mountBridge(conv, mountPort)
+        result = await proc.loadSession({
+          sessionId: persisted.acpSessionId,
+          cwd: effectiveCwd,
+          mcpServers: mount.mcpServers,
+          _meta: mount.sessionMeta,
+        }, mount.listener, 60_000)
+        const loadedId = result.sessionId || persisted.acpSessionId
+        if (
+          attempt === 0
+          && engineMode === 'bridge'
+          && conv.tenantKey !== undefined
+          && conv.advertisedTools.length > 0
+          && workerMissedExperiments(slot.layout.logFile, loadedId)
+        ) {
+          this.host.log.warn(`antigravity-acp: worker for ${loadedId} missed ListExperiments during session/load; retiring worker and retrying once`)
+          await proc.closeSession(loadedId)
+          this.releaseTenant(conv)
+          conv.tenantKey = undefined
+          conv.tenantSecret = undefined
+          await delay(250)
+          continue
+        }
+        break
+      }
+      const settled = result!
+      conv.sessionId = settled.sessionId || persisted.acpSessionId
       conv.process = proc
       conv.engineMode = engineMode
       conv.sessionCwd = effectiveCwd
-      conv.configOptions = result.configOptions ?? []
+      conv.configOptions = settled.configOptions ?? []
       conv.systemHash = persisted.systemHash
       conv.knownIds = [...persisted.knownIds]
       conv.issuedIds = new Set(persisted.issuedIds)
       conv.model = undefined
       conv.effort = undefined
       conv.dirty = false
-      this.observeSlotCatalog(slot, result.configOptions, result.models?.availableModels)
+      this.observeSlotCatalog(slot, settled.configOptions, settled.models?.availableModels)
       return true
     } catch (error) {
       conv.engineMode = undefined
@@ -1614,6 +1640,7 @@ export class AntigravityRuntime {
       usageSource: undefined,
       genMetaCursor: -1,
       usageCursor: -1,
+      stepCursor: -1,
       backfilledSteps: 0,
       health: new RouteHealth(purpose === MAIN_PURPOSE),
       reanswer: freshReanswer(),
@@ -1772,33 +1799,54 @@ export class AntigravityRuntime {
     conv.knownTools = new Map(tools.map(t => [t.name, digest(t)]))
     conv.engineMode = engineMode
     conv.sessionCwd = effectiveCwd
-    const mount = mountBridge(conv, {
+    const mountPort = {
       bridgeUrl: this.bridge.url,
       engineMode,
       system,
       ...(engineMode === 'native' ? { toolContracts: renderFullToolContracts(activeSchemas, MAX_EAGER_BRIDGE_TOOL_BYTES) } : {}),
-      registerTenant: (tenantKey, tenant) => this.tenants.set(tenantKey, tenant),
-      observeConfigOptions: options => this.observeSlotCatalog(slot, options, undefined),
-      permission: request => this.answerPermission(conv, request),
-      warn: message => this.host.log.warn(message),
-    })
+      registerTenant: (tenantKey: string, tenant: Conversation) => this.tenants.set(tenantKey, tenant),
+      observeConfigOptions: (options: AcpConfigOption[]) => this.observeSlotCatalog(slot, options, undefined),
+      permission: (request: AcpPermissionRequest) => this.answerPermission(conv, request),
+      warn: (message: string) => this.host.log.warn(message),
+    }
     try {
-      const result = await proc.newSession({
-        cwd: effectiveCwd,
-        mcpServers: mount.mcpServers,
-        _meta: mount.sessionMeta,
-      }, mount.listener, 120_000)
-      conv.sessionId = result.sessionId
+      let result: Awaited<ReturnType<AcpProcess['newSession']>> | undefined
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const mount = mountBridge(conv, mountPort)
+        result = await proc.newSession({
+          cwd: effectiveCwd,
+          mcpServers: mount.mcpServers,
+          _meta: mount.sessionMeta,
+        }, mount.listener, 120_000)
+        if (
+          attempt === 0
+          && engineMode === 'bridge'
+          && conv.tenantKey !== undefined
+          && conv.advertisedTools.length > 0
+          && workerMissedExperiments(slot.layout.logFile, result.sessionId)
+        ) {
+          this.host.log.warn(`antigravity-acp: worker for ${result.sessionId} missed ListExperiments during session/new; retiring worker and retrying once`)
+          await proc.closeSession(result.sessionId)
+          this.releaseTenant(conv)
+          conv.tenantKey = undefined
+          conv.tenantSecret = undefined
+          await delay(250)
+          continue
+        }
+        break
+      }
+      const settled = result!
+      conv.sessionId = settled.sessionId
       conv.process = proc
       conv.engineMode = engineMode
       conv.sessionCwd = effectiveCwd
-      conv.configOptions = result.configOptions ?? []
+      conv.configOptions = settled.configOptions ?? []
       conv.model = undefined
       conv.effort = undefined
       this.resetUsageReading(conv)
       conv.dirty = false
       conv.issuedIds.clear()
-      this.observeSlotCatalog(slot, result.configOptions, result.models?.availableModels)
+      this.observeSlotCatalog(slot, settled.configOptions, settled.models?.availableModels)
     } catch (error) {
       conv.engineMode = undefined
       conv.sessionCwd = undefined
@@ -1846,11 +1894,11 @@ export class AntigravityRuntime {
     })
   }
 
-  private async resetSession(conv: Conversation, keepPersisted = false): Promise<void> {
+  private async resetSession(conv: Conversation, keepPersisted = false, awaitClose = false): Promise<void> {
     if (!keepPersisted) this.sessions.forget(conv.dshSessionId)
-    if (conv.sessionId !== undefined && conv.process !== undefined) {
-      void conv.process.closeSession(conv.sessionId)
-    }
+    const closing = conv.sessionId !== undefined && conv.process !== undefined
+      ? conv.process.closeSession(conv.sessionId)
+      : undefined
     this.releaseTenant(conv)
     conv.sessionId = undefined
     conv.tenantKey = undefined
@@ -1870,6 +1918,7 @@ export class AntigravityRuntime {
     conv.reanswer = freshReanswer()
     conv.knownIds = undefined
     conv.dirty = false
+    if (awaitClose && closing !== undefined) await closing
   }
 
   private async handoff(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[], hasHistory: boolean, recovery: AcpTurn['idleRecovery'], signal?: AbortSignal): Promise<AcpPromptBlock[]> {
@@ -1972,6 +2021,7 @@ export class AntigravityRuntime {
   private pinUsageCursors(conv: Conversation, dbPath: string): void {
     conv.genMetaCursor = peekMaxGenMetadataIdx(dbPath)
     conv.usageCursor = peekMaxModelStepIdx(dbPath)
+    conv.stepCursor = peekMaxStepIdx(dbPath)
   }
 
   /**
@@ -1983,6 +2033,7 @@ export class AntigravityRuntime {
     conv.usageSource = undefined
     conv.genMetaCursor = -1
     conv.usageCursor = -1
+    conv.stepCursor = -1
     conv.backfilledSteps = 0
   }
 
@@ -2075,6 +2126,7 @@ export class AntigravityRuntime {
     const holdZeroThoughtText = conv.purpose === MAIN_PURPOSE && isGemini4Flagship(options.model) && effort === 'high'
       && this.degradeAction() !== 'observe'
     let finishKind: string | undefined
+    let retireBrokenWorker = false
     try {
       for await (const chunk of pumpStep(turn, {
         parkSettleMs: this.host.config.parkSettleMs,
@@ -2090,18 +2142,53 @@ export class AntigravityRuntime {
           this.lastTurn = { model: options.model, effort, steps, ...usage !== undefined ? { usage } : {}, at: new Date().toISOString() }
         },
         verifyEndTurn: async () => {
-          if (conv.purpose !== MAIN_PURPOSE || !isGemini4Flagship(options.model) || conv.sessionId === undefined) {
+          if (conv.sessionId === undefined) return 'ok'
+          const dbPath = sessionDbPath(slot.layout.geminiDir, conv.sessionId)
+          const dbPresent = existsSync(dbPath)
+          let verdict: DegradeFingerprintResult | undefined
+          let genChecked = false
+          const checkBridgeTools = conv.engineMode === 'bridge'
+            && conv.tenantKey !== undefined
+            && conv.advertisedTools.length > 0
+            && turn.toolSteps === 0
+          if (checkBridgeTools) {
+            if (dbPresent && this.usageSource(conv, dbPath) === 'gen' && !turn.hasStagedUsage()) {
+              verdict = await this.readGenStepSample(conv, dbPath, options.model, effort, {
+                isToolStep: false,
+                isInterceptable: false,
+              })
+              genChecked = true
+            }
+            const stagedSteps = turn.peekStagedUsage()?.steps ?? []
+            const missingTools = turn.missingBridgeTools
+              || hasMissingBridgeToolDeclaration(stagedSteps)
+              || (dbPresent && hasUnknownBridgeToolStep(dbPath, conv.stepCursor))
+            if (missingTools) {
+              const prior = this.mcpRecoveries.get(conv.key)
+              const retries = prior?.key === ctx.requestKey ? prior.retries : 0
+              if (retries < 1) {
+                this.mcpRecoveries.set(conv.key, { key: ctx.requestKey, retries: retries + 1 })
+                this.host.log.warn(`antigravity-acp: bridge MCP tools missing on worker for ${conv.key} (${conv.sessionId}); retiring worker and retrying`)
+                turn.discardStagedUsage()
+                return 'missing-tools'
+              }
+              this.host.log.warn(`antigravity-acp: bridge MCP tools still missing after recovery for ${conv.key} (${conv.sessionId}); delivering answer and retiring worker`)
+              retireBrokenWorker = true
+              return 'ok'
+            }
+          }
+          if (conv.purpose !== MAIN_PURPOSE || !isGemini4Flagship(options.model)) {
             return 'ok'
           }
-          const dbPath = sessionDbPath(slot.layout.geminiDir, conv.sessionId)
-          if (!existsSync(dbPath)) return 'ok'
-          if (this.usageSource(conv, dbPath) !== 'gen') return 'ok'
-          // The merged read both reports this step's usage and judges its route, so
-          // the answer is refused before the usage chunk is ever produced.
-          const verdict = await this.readGenStepSample(conv, dbPath, options.model, effort, {
-            isToolStep: false,
-            isInterceptable: false,
-          })
+          if (!dbPresent || this.usageSource(conv, dbPath) !== 'gen') return 'ok'
+          if (!genChecked) {
+            // The merged read both reports this step's usage and judges its route, so
+            // the answer is refused before the usage chunk is ever produced.
+            verdict = await this.readGenStepSample(conv, dbPath, options.model, effort, {
+              isToolStep: false,
+              isInterceptable: false,
+            })
+          }
           if (verdict?.degraded !== true) return 'ok'
           // A verdict outside the intervention level is recorded (the end-of-turn
           // read already counts it as this turn's hit) and the answer is delivered.
@@ -2209,6 +2296,13 @@ export class AntigravityRuntime {
         await Promise.race([conv.promptSettled, delay(3_000)])
         throw error
       }
+      if (isBridgeToolsMissingFailure(error)) {
+        conv.reportedToolCalls.clear()
+        conv.turn = undefined
+        const keepPersisted = conv.dshSessionId !== undefined && this.sessions.get(conv.dshSessionId) !== undefined
+        await this.resetSession(conv, keepPersisted, true)
+        throw error
+      }
       conv.reportedToolCalls.clear()
       conv.turn = undefined
       conv.dirty = true
@@ -2225,7 +2319,14 @@ export class AntigravityRuntime {
       await turnSettled(turn, 5_000)
       conv.dirty = true
       this.sessions.forget(conv.dshSessionId)
+    } else if (retireBrokenWorker) {
+      const keepPersisted = conv.dshSessionId !== undefined && this.sessions.get(conv.dshSessionId) !== undefined
+      conv.reportedToolCalls.clear()
+      conv.turn = undefined
+      await this.resetSession(conv, keepPersisted, true)
+      return
     } else {
+      this.mcpRecoveries.delete(conv.key)
       conv.knownIds = ctx.nextKnownIds
       conv.reanswer.rounds += 1
       conv.health.finalizeTurnHealth(options.model)

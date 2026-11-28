@@ -78,6 +78,33 @@ const procCwdLog = process.env.FAKE_AGY_PROC_CWD
 if (procCwdLog) appendFileSync(procCwdLog, `${JSON.stringify(process.cwd())}\n`)
 const geminiDirFlag = process.argv.indexOf('--gemini-dir')
 const geminiDir = geminiDirFlag >= 0 ? process.argv[geminiDirFlag + 1] : undefined
+const logFileFlag = process.argv.indexOf('--log-file')
+const acpLogFile = logFileFlag >= 0 ? process.argv[logFileFlag + 1] : undefined
+const workerLogEvents = JSON.parse(process.env.FAKE_AGY_WORKER_LOG_EVENTS ?? '[]')
+let nextWorkerNum = 1
+function emitFakeWorkerBootLog(sessionId) {
+  if (!acpLogFile || workerLogEvents.length === 0) return
+  const outcome = workerLogEvents.shift()
+  if (outcome === undefined) return
+  const workerNum = nextWorkerNum++
+  const workerPid = 900000 + workerNum
+  mkdirSync(dirname(acpLogFile), { recursive: true })
+  appendFileSync(acpLogFile, `I1128 09:19:19.728030      44 router.go:1049] front: started worker ${workerNum} (pid ${workerPid})\n`)
+  const workerLines = [
+    'I1128 09:19:19.813987       1 serve.go:30] Starting ACP server (worker=true)',
+    'E1128 09:19:19.817382      16 errorreport.go:282] Failed to poll ListExperiments: error getting token source: You are not logged into Antigravity.',
+    'I1128 09:19:19.849077      98 server_oauth.go:226] OAuth: authenticated successfully as test@example.com',
+  ]
+  if (outcome === 'eof') {
+    workerLines.push('E1128 09:19:21.962471      98 errorreport.go:282] Failed to poll ListExperiments: Post "https://daily-cloudcode-pa.googleapis.com/v1internal:listExperiments": EOF')
+  } else {
+    workerLines.push('I1128 09:19:21.813274      16 http_helpers.go:108] UseAICodeMendel routing switch changed: false -> true')
+  }
+  workerLines.push(`I1128 09:19:21.962948      98 session_handlers.go:485] Loading/Resuming session: ${sessionId}`)
+  workerLines.push('I1128 09:19:21.962969      98 session_handlers.go:397] Preloading 1 MCP servers of the session')
+  writeFileSync(`${acpLogFile}.${workerPid}`, `${workerLines.join('\n')}\n`)
+  appendFileSync(acpLogFile, `I1128 09:19:21.995422      98 router.go:937] front: session ${sessionId} served by worker ${workerNum}\n`)
+}
 const persistedFile = geminiDir ? join(geminiDir, 'fake-sessions.json') : undefined
 
 const sessions = new Map()
@@ -158,9 +185,13 @@ function writeGenMetadataRow(sessionId, idx, meta) {
     ...encodeVarint((9n << 3n) | 0n), ...encodeVarint(meta.thoughtTokens ?? 0),
     ...encodeVarint((10n << 3n) | 0n), ...encodeVarint(meta.textOutTokens ?? 0),
   ]
+  const toolDecls = Array.isArray(meta.declaredTools)
+    ? meta.declaredTools.flatMap(name => encodeLen(8, encodeLen(1, [...Buffer.from(String(name), 'utf8')])))
+    : []
   const chat = [
     ...encodeVarint((3n << 3n) | 0n), ...encodeVarint(meta.modelEnum ?? 1417),
     ...encodeLen(4, usage),
+    ...toolDecls,
     ...(meta.cwmEstTokens !== undefined
       ? encodeLen(9, encodeLen(10, [...encodeVarint((1n << 3n) | 0n), ...encodeVarint(meta.cwmEstTokens)]))
       : []),
@@ -172,6 +203,23 @@ function writeGenMetadataRow(sessionId, idx, meta) {
   try {
     db.exec('CREATE TABLE IF NOT EXISTS gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER NOT NULL DEFAULT 0)')
     db.prepare('INSERT OR REPLACE INTO gen_metadata (idx, data, size) VALUES (?, ?, ?)').run(idx, blob, blob.length)
+  } finally {
+    db.close()
+  }
+}
+function writeUnknownToolSteps(sessionId, toolNames) {
+  if (!geminiDir || !Array.isArray(toolNames) || toolNames.length === 0) return
+  const dbPath = join(geminiDir, 'agy', 'conversations', `${sessionId}.db`)
+  mkdirSync(dirname(dbPath), { recursive: true })
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB, error_details BLOB, step_payload BLOB)')
+    let nextIdx = Number(db.prepare('SELECT COALESCE(MAX(idx), -1) AS m FROM steps').get()?.m ?? -1) + 1
+    for (const name of toolNames) {
+      const msg = `unknown tool: "${name}" — check spelling`
+      const errBytes = new Uint8Array(encodeLen(2, [...Buffer.from(msg, 'utf8')]))
+      db.prepare('INSERT INTO steps (idx, step_type, status, metadata, error_details, step_payload) VALUES (?, 132, 4, NULL, ?, NULL)').run(nextIdx++, errBytes)
+    }
   } finally {
     db.close()
   }
@@ -362,6 +410,9 @@ function beginPlanPart(s, part) {
     s.genIdx = gIdx + 1
     persistSessions()
     writeGenMetadataRow(s.id, gIdx, part.gen)
+  }
+  if (Array.isArray(part.unknownToolSteps)) {
+    writeUnknownToolSteps(s.id, part.unknownToolSteps)
   }
   if (typeof part.thought === 'string' && part.thought.length > 0) {
     update(s.id, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: part.thought } })
@@ -638,6 +689,7 @@ rl.on('line', async (line) => {
       if (mcpLog) {
         appendFileSync(mcpLog, `${JSON.stringify({ op: 'new', session: s.id, cwd: s.cwd, url: s.mcp?.url, authorization: s.mcp?.headers?.find(h => h.name.toLowerCase() === 'authorization')?.value })}\n`)
       }
+      emitFakeWorkerBootLog(s.id)
       return send({ jsonrpc: '2.0', id, result: { sessionId: s.id, configOptions: configOptions(s), models: { availableModels: availableModels(), currentModelId: `${s.model}-${s.level}` } } })
     }
     if (method === 'session/load') {
@@ -659,6 +711,7 @@ rl.on('line', async (line) => {
       if (mcpLog) {
         appendFileSync(mcpLog, `${JSON.stringify({ op: 'load', session: s.id, cwd: s.cwd, url: s.mcp?.url, authorization: s.mcp?.headers?.find(h => h.name.toLowerCase() === 'authorization')?.value })}\n`)
       }
+      emitFakeWorkerBootLog(s.id)
       return send({ jsonrpc: '2.0', id, result: { sessionId: s.id, configOptions: configOptions(s), models: { availableModels: availableModels(), currentModelId: `${s.model}-${s.level}` } } })
     }
     const s = sessions.get(params?.sessionId)

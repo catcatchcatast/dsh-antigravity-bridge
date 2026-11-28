@@ -6,10 +6,11 @@
  * @module dsh-llm-antigravity-acp/usage-db
  */
 
-import { existsSync } from 'node:fs'
+import { closeSync, existsSync, fstatSync, openSync, readSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import type { AcpPromptResult } from './acp-process.ts'
+import { AGENT_TOOL_PREFIX } from './history.ts'
 
 type DatabaseSync = new (
   path: string,
@@ -86,6 +87,10 @@ export interface GenUsageBatch extends StepUsageSample {
 export interface DecodedGenMetadataRecord extends DecodedStepRecord {
   /** Pre-send local context token estimate (`f1.9.10.1`). */
   cwmEstTokens?: number
+  /** Count of tool declarations (`f1.8.1`) recorded on an unstripped `gen_metadata` request blob. */
+  declaredToolCount?: number
+  /** Whether any declared tool (`f1.8.1`) carries the DSH bridge prefix (`mcp_dsh_`). */
+  hasBridgeTool?: boolean
 }
 
 /** Batch of `gen_metadata` rows read after a cursor. */
@@ -315,6 +320,8 @@ function parseGenChatSubmessage(buf: Uint8Array): Omit<DecodedGenMetadataRecord,
   let sawUsage = false
   let chatModelEnum: number | undefined
   let cwmEstTokens: number | undefined
+  let declaredToolCount = 0
+  let hasBridgeTool = false
   let ttftSeconds = 0
   let streamSeconds = 0
   const stats: InternalUsageDecode = {
@@ -335,6 +342,13 @@ function parseGenChatSubmessage(buf: Uint8Array): Omit<DecodedGenMetadataRecord,
     if (field === 4) {
       if (!parseModelUsageSubmessage(bytes, stats)) return 'invalid'
       sawUsage = true
+    } else if (field === 8) {
+      const nameBytes = bytesField(bytes, 1)
+      if (nameBytes !== undefined && nameBytes.length > 0) {
+        const name = Buffer.from(nameBytes).toString('utf8')
+        declaredToolCount++
+        if (name.startsWith(AGENT_TOOL_PREFIX)) hasBridgeTool = true
+      }
     } else if (field === 9) {
       const est = parseChatStartCwmTokens(bytes)
       if (est !== undefined && est > 0) cwmEstTokens = est
@@ -359,6 +373,7 @@ function parseGenChatSubmessage(buf: Uint8Array): Omit<DecodedGenMetadataRecord,
     textOutTokens: stats.textOutTokens,
     ...(modelEnum !== undefined ? { modelEnum } : {}),
     ...(cwmEstTokens !== undefined ? { cwmEstTokens } : {}),
+    ...(declaredToolCount > 0 ? { declaredToolCount, hasBridgeTool } : {}),
     ttftSeconds,
     streamSeconds,
     wallSeconds: ttftSeconds + streamSeconds,
@@ -523,6 +538,103 @@ export function peekMaxGenMetadataIdx(dbPath: string): number {
   } catch {
     return -1
   }
+}
+
+/** Read the current maximum `steps.idx` across all step types so per-turn checks skip prior turns. */
+export function peekMaxStepIdx(dbPath: string): number {
+  if (!existsSync(dbPath)) return -1
+  const Database = loadDatabaseSync()
+  if (Database === undefined) return -1
+  try {
+    const db = new Database(dbPath, { readOnly: true, timeout: 100 })
+    try {
+      const row = db.prepare('SELECT COALESCE(MAX(idx), -1) AS maxIdx FROM steps').get()
+      const raw = row?.['maxIdx']
+      if (typeof raw === 'number' && Number.isFinite(raw)) return raw
+      if (typeof raw === 'bigint') return Number(raw)
+      return -1
+    } finally {
+      db.close()
+    }
+  } catch {
+    return -1
+  }
+}
+
+/** Whether any unstripped `gen_metadata` step declared tools yet omitted all `mcp_dsh_*` bridge tools. */
+export function hasMissingBridgeToolDeclaration(steps: readonly DecodedModelUsage[]): boolean {
+  return steps.some((step) => {
+    const rec = step as Partial<DecodedGenMetadataRecord>
+    return typeof rec.declaredToolCount === 'number' && rec.declaredToolCount > 0 && rec.hasBridgeTool === false
+  })
+}
+
+const UNKNOWN_BRIDGE_TOOL = /unknown tool:\s*"mcp_dsh_/i
+
+/** Whether this turn recorded an `agy` tool-call rejection for an unknown `mcp_dsh_*` bridge tool. */
+export function hasUnknownBridgeToolStep(dbPath: string, afterStepIdx: number): boolean {
+  if (!existsSync(dbPath)) return false
+  const Database = loadDatabaseSync()
+  if (Database === undefined) return false
+  try {
+    const db = new Database(dbPath, { readOnly: true, timeout: 100 })
+    try {
+      const rows = db.prepare('SELECT error_details FROM steps WHERE step_type = 132 AND status = 4 AND idx > ? ORDER BY idx DESC LIMIT 8').all(afterStepIdx)
+      for (const row of rows) {
+        const detail = bytesField(row['error_details'], 2)
+        if (detail !== undefined && UNKNOWN_BRIDGE_TOOL.test(Buffer.from(detail).toString('utf8'))) return true
+      }
+      return false
+    } finally {
+      db.close()
+    }
+  } catch {
+    return false
+  }
+}
+
+function readTailUtf8(path: string, maxBytes: number): string | undefined {
+  if (!existsSync(path)) return undefined
+  let fd: number | undefined
+  try {
+    fd = openSync(path, 'r')
+    const size = fstatSync(fd).size
+    if (size <= 0) return ''
+    const len = Math.min(size, maxBytes)
+    const buf = Buffer.allocUnsafe(len)
+    const read = readSync(fd, buf, 0, len, size - len)
+    return buf.subarray(0, read).toString('utf8')
+  } catch {
+    return undefined
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd) } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
+ * Whether the `--process-per-session` worker serving `sessionId` failed `ListExperiments`
+ * after OAuth and booted without Mendel flags (which disables `CASCADE_ENABLE_MCP_TOOLS`).
+ */
+export function workerMissedExperiments(logFile: string, sessionId: string): boolean {
+  const frontTail = readTailUtf8(logFile, 65_536)
+  if (!frontTail) return false
+  const escaped = sessionId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const servedMatches = [...frontTail.matchAll(new RegExp(`front: session ${escaped} served by worker (\\d+)`, 'g'))]
+  const workerNum = servedMatches.at(-1)?.[1]
+  if (workerNum === undefined) return false
+  const startedMatches = [...frontTail.matchAll(new RegExp(`front: started worker ${workerNum} \\(pid (\\d+)\\)`, 'g'))]
+  const workerPid = startedMatches.at(-1)?.[1]
+  if (workerPid === undefined) return false
+  const workerTail = readTailUtf8(`${logFile}.${workerPid}`, 131_072)
+  if (!workerTail) return false
+  const authMarker = 'OAuth: authenticated successfully'
+  const authIdx = workerTail.lastIndexOf(authMarker)
+  if (authIdx < 0) return false
+  const postAuth = workerTail.slice(authIdx + authMarker.length)
+  return postAuth.includes('Failed to poll ListExperiments')
+    && !postAuth.includes('UseAICodeMendel routing switch changed: false -> true')
 }
 
 function asBytes(raw: unknown): Uint8Array | undefined {

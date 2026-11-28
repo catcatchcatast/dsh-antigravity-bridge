@@ -72,6 +72,8 @@ export interface Conversation {
   genMetaCursor: number
   /** Exclusive lower-bound `steps.idx`, used only by the legacy fallback path. */
   usageCursor: number
+  /** Exclusive lower-bound `steps.idx` across all step types, for current-turn diagnostics. */
+  stepCursor: number
   /** Completed steps already back-filled from `steps` because `gen_metadata` never billed them. */
   backfilledSteps: number
   /** Degradation fingerprint state and the numbers the quota pill reads. */

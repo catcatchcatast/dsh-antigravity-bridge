@@ -235,6 +235,24 @@ export function isReanswerFailure(error: unknown): boolean {
   return code === 'DEGRADED_ROUTE' || code === 'DEGRADED_ROUTE_EXHAUSTED'
 }
 
+const BRIDGE_TOOLS_MISSING = Symbol('bridgeToolsMissing')
+
+/** Retryable failure raised when an `agy` worker runs a bridge turn without mounting DSH MCP tools. */
+export function bridgeToolsMissingError(): LlmError {
+  const error = new LlmError(
+    labeled('TRANSPORT', 'agy worker 未挂载 DSH MCP 工具，已关闭异常 worker 并自动重连。'),
+    'TRANSPORT',
+    { providerRetryAfterMs: 1_000 },
+  )
+  ;(error as unknown as Record<symbol, boolean>)[BRIDGE_TOOLS_MISSING] = true
+  return error
+}
+
+/** Whether `error` was raised by {@link bridgeToolsMissingError}. */
+export function isBridgeToolsMissingFailure(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as Record<symbol, unknown>)[BRIDGE_TOOLS_MISSING] === true
+}
+
 export function idleError(message: string): LlmError {
   if ('fromFailure' in LlmError && typeof LlmError.fromFailure === 'function') return LlmError.fromFailure({ code: 'MODEL_IDLE', message })
   return new LlmError(message, 'MODEL_IDLE')
@@ -375,6 +393,8 @@ export class AcpTurn {
   retryNotices = 0
   /** Terminal transport or overload failure reported as message text by agy. */
   agentFailure: LlmError | undefined
+  /** Observed an `unknown tool: "mcp_dsh_..."` rejection on this turn's ACP stream. */
+  missingBridgeTools = false
   upstreamStopped = false
   cancelUpstreamRetry?: () => void
   onUpstreamRetry?: (error: LlmError) => void
@@ -456,6 +476,11 @@ export class AcpTurn {
     return this.stagedUsage !== undefined
   }
 
+  /** Inspect staged usage without consuming it (used by end-of-turn guards). */
+  peekStagedUsage(): StepUsageSample | undefined {
+    return this.stagedUsage
+  }
+
   /**
    * Drop the usage staged for a step that will never be delivered, counting it as
    * already emitted so a later fallback subtraction never reports it twice.
@@ -519,6 +544,14 @@ export class AcpTurn {
       if (held.length > 0 && !this.relaying) this.events.push({ kind: 'text', text: held })
       if (text.length > 0 && !this.relaying) this.events.push({ kind: 'thought', text })
       return
+    }
+    if (update.sessionUpdate === 'tool_call_update' && update.status === 'failed') {
+      const raw = [
+        text,
+        typeof update.title === 'string' ? update.title : '',
+        typeof update['rawOutput'] === 'string' ? update['rawOutput'] : '',
+      ].join('\n')
+      if (/unknown tool:\s*"mcp_dsh_/i.test(raw)) this.missingBridgeTools = true
     }
     if (
       this.nativeMode
@@ -701,11 +734,12 @@ export interface PumpHost {
    */
   consumeStepUsage?(options: { final: boolean }): Promise<{ usage: NonNullable<AcpPromptResult['usage']>; calls: number } | undefined>
   /**
-   * Verify SQLite `gen_metadata` on `end_turn` before the answer is delivered.
-   * `degrade` discards the held answer and fails the step so the harness
-   * re-asks the identical request.
+   * Verify SQLite `gen_metadata` / `steps` on `end_turn` before the answer is delivered.
+   * `degrade` discards the held answer and fails the step so the harness re-asks the
+   * identical request; `missing-tools` retires a broken worker whose DSH MCP tools did
+   * not mount and fails with a retryable transport error.
    */
-  verifyEndTurn?(hadZeroThoughtHold: boolean): Promise<'ok' | 'degrade'>
+  verifyEndTurn?(hadZeroThoughtHold: boolean): Promise<'ok' | 'degrade' | 'missing-tools'>
 }
 
 /**
@@ -873,7 +907,8 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
         }
         if (stop === 'end_turn' && host.verifyEndTurn !== undefined) {
           const hadZeroThoughtHold = !sawStepThought && heldZeroThoughtText.length > 0 && !emittedVisibleText
-          if (await host.verifyEndTurn(hadZeroThoughtHold) === 'degrade') {
+          const verdict = await host.verifyEndTurn(hadZeroThoughtHold)
+          if (verdict === 'degrade') {
             // The degraded answer is discarded: held text never reaches the
             // transcript, and the step fails so the harness re-asks the same
             // request. Reasoning already streamed stays.
@@ -881,6 +916,12 @@ export async function * pumpStep(turn: AcpTurn, host: PumpHost, signal: AbortSig
             turn.finished = true
             yield * close()
             throw degradedRouteError()
+          }
+          if (verdict === 'missing-tools') {
+            heldZeroThoughtText = ''
+            turn.finished = true
+            yield * close()
+            throw bridgeToolsMissingError()
           }
         }
         yield * flushHeldText()
